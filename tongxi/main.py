@@ -5,31 +5,35 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from . import adapters, domain, models
+from .analysis import AnalysisService
 from .store import Store, require
 
 ROOT = Path(__file__).parent / "web"
 
 
-def create_app():
+def create_app(auto_ai=True):
     semantic = adapters.LocalSemantic()
     tts = adapters.LocalTTS()
 
     @asynccontextmanager
     async def lifespan(app):
         yield
+        await analysis.shutdown()
         semantic.close()
         tts.clear()
 
     app = FastAPI(title="同席 · 房间服务", version="0.1.0", lifespan=lifespan)
-    store = Store()
+    store = Store(auto_ai=auto_ai)
     app.state.store = store
     asr = adapters.LocalASR()
+    analysis = AnalysisService(store, semantic)
+    app.state.analysis = analysis
 
     @app.middleware("http")
     async def protections(request, call_next):
@@ -70,12 +74,16 @@ def create_app():
         return command(request, room, who, idempotency_key, data, lambda r: domain.consent(r, who, data))
 
     @app.post("/api/v1/rooms/{room}/segments")
-    def segment(room: str, data: models.Segment, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
-        return command(request, room, who, idempotency_key, data, lambda r: domain.add_segment(r, who, data))
+    def segment(room: str, data: models.Segment, request: Request, background: BackgroundTasks, who=Depends(actor), idempotency_key: str = Header(default="")):
+        result = command(request, room, who, idempotency_key, data, lambda r: domain.add_segment(r, who, data))
+        background.add_task(analysis.trigger, room)
+        return result
 
     @app.patch("/api/v1/rooms/{room}/segments/{segment_id}")
-    def revise(room: str, segment_id: str, data: models.Revision, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
-        return command(request, room, who, idempotency_key, data, lambda r: domain.revise(r, who, segment_id, data))
+    def revise(room: str, segment_id: str, data: models.Revision, request: Request, background: BackgroundTasks, who=Depends(actor), idempotency_key: str = Header(default="")):
+        result = command(request, room, who, idempotency_key, data, lambda r: domain.revise(r, who, segment_id, data))
+        background.add_task(analysis.trigger, room)
+        return result
 
     @app.post("/api/v1/rooms/{room}/decisions")
     def decision(room: str, data: models.Decision, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
@@ -98,9 +106,18 @@ def create_app():
         return command(request, room, who, idempotency_key, data, lambda r: domain.act_request(r, who, request_id, data))
 
     @app.post("/api/v1/rooms/{room}/matches")
-    def matches(room: str, data: models.Match, who=Depends(actor)):
+    async def matches(room: str, data: models.Match, who=Depends(actor)):
         domain.member(who)
-        return {"items": adapters.match(store.read(room), data.text), "provider": "本地词组检索"}
+        before = store.read(room)
+        require(before["status"] == "open", "房间已结束", 410)
+        try:
+            result = await run_in_threadpool(adapters.semantic_match, before, data.text, semantic)
+        except HTTPException as error:
+            result = {"items": adapters.match(before, data.text), "provider": "词组检索（本地语义暂不可用）", "warning": error.detail}
+        latest = store.read(room)
+        require(latest["status"] == "open", "房间已结束", 410)
+        require(latest["decisions"] == before["decisions"] and latest["segments"] == before["segments"], "原议题或原句已更新，请重新查找", 409)
+        return result
 
     @app.post("/api/v1/rooms/{room}/contributions")
     def contribute(room: str, data: models.Contribution, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
@@ -124,17 +141,25 @@ def create_app():
     @app.post("/api/v1/rooms/{room}/analyze")
     async def analyze(room: str, who=Depends(actor)):
         domain.host(who)
-        state = store.read(room)
-        raw = await run_in_threadpool(adapters.candidates, state, semantic)
-        valid = []
-        for candidate in raw:
-            try:
-                parsed = models.Decision.model_validate(candidate)
-                domain.validate_evidence(store.read(room), [e.model_dump() for e in parsed.evidence])
-                valid.append(parsed.model_dump())
-            except (ValueError, HTTPException):
-                continue
-        return {"items": valid, "provider": adapters.capabilities()["semantic"]["label"]}
+        task = await analysis.trigger(room, force=True)
+        if task:
+            await task
+        result = store.read(room)["analysis"]
+        require(result["status"] != "error", result.get("error", "分析失败"), 503)
+        return result
+
+    @app.put("/api/v1/rooms/{room}/ai/settings")
+    async def ai_settings(room: str, data: models.AISettings, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
+        def update(r):
+            domain.host(who)
+            r["ai_enabled"] = data.enabled
+            if not data.enabled:
+                r["analysis"].update(status="paused", items=[])
+            return {"enabled": data.enabled}
+        result = command(request, room, who, idempotency_key, data, update)
+        if data.enabled:
+            await analysis.trigger(room)
+        return result
 
     @app.get("/api/v1/rooms/{room}/speech/{segment_id}/{rev}")
     async def speech(room: str, segment_id: str, rev: int, who=Depends(actor)):
@@ -179,7 +204,7 @@ def create_app():
         return export_data(r)
 
     @app.post("/api/v1/rooms/{room}/demo")
-    def demo(room: str, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
+    def demo(room: str, request: Request, background: BackgroundTasks, who=Depends(actor), idempotency_key: str = Header(default="")):
         def seed(r):
             domain.host(who)
             require(not r["segments"], "示例只能载入空白房间", 409)
@@ -188,7 +213,9 @@ def create_app():
                 domain.add_segment(r, who, models.Segment(text=text))
             return domain.create_decision(r, who, models.Decision(title="校园活动方案 B", conclusion="周六采用方案 B 开展活动",
                         evidence=[models.Evidence(segment=r["segments"][1]["id"], rev=1)]))
-        return command(request, room, who, idempotency_key, None, seed)
+        result = command(request, room, who, idempotency_key, None, seed)
+        background.add_task(analysis.trigger, room)
+        return result
 
     @app.post("/api/v1/rooms/{room}/close")
     def close(room: str, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
@@ -196,7 +223,8 @@ def create_app():
         tts.clear()
         def clear(r):
             domain.host(who)
-            r.update(status="closed", invite="", board_token="", segments=[], decisions=[], requests=[], contributions=[], history=[])
+            r.update(status="closed", invite="", board_token="", segments=[], decisions=[], requests=[], contributions=[], history=[],
+                     analysis={"status": "idle", "items": [], "summary": "", "phase": "uncertain", "error": ""})
             for m in r["members"].values():
                 m.update(presentation=None, epoch="", heartbeat=0)
             # 删除包含旧内容的幂等结果，房间结束后只保留清空后的状态。

@@ -230,5 +230,6 @@ def snapshot(room, actor):
                 contributions=[c for c in room["contributions"] if actor["role"] == "host" or c["member"] == actor["id"]])
     if actor["role"] == "host":
         base.update(invite=room["invite"], board_token=room["board_token"], revision=room["revision"], history=room["history"],
+                    analysis=room.get("analysis"), ai_enabled=room.get("ai_enabled", True),
                     members=[{"id": mid, "name": p["name"], "role": p["role"]} for mid, p in room["members"].items()])
     return copy.deepcopy(base)

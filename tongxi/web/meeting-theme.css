@@ -385,3 +385,6 @@ button.primary:hover { background: #1f559f; border-color: #1f559f; }
   .stage { box-shadow: 4px 4px 0 #e6edf5; }
   .home-grid article, .home-grid article:first-child { border-color: #e1e8f0; }
 }
+.ai-analysis-meta { display: flex; flex-wrap: wrap; gap: 16px; margin: 14px 0; color: #62758b; font-size: .82rem; }
+.quote details { margin: 12px 0; }
+.quote summary { cursor: pointer; color: #315b99; }

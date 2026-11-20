@@ -2,3 +2,6 @@
 faster-whisper==1.2.1
 # PyAV 19 移除了 faster-whisper 1.2.1 使用的 metadata_errors 参数。
 av==16.1.0
+onnxruntime==1.32.0
+tokenizers==0.23.3
+numpy>=1.24,<3

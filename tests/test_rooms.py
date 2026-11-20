@@ -10,7 +10,7 @@ from tongxi.main import create_app
 
 @pytest.fixture
 def env():
-    app = create_app()
+    app = create_app(auto_ai=False)
     with TestClient(app) as client:
         yield client, app.state.store
 

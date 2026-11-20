@@ -20,7 +20,8 @@ def require(condition, message, code=422):
 
 
 class Store:
-    def __init__(self):
+    def __init__(self, auto_ai=True):
+        self.auto_ai = auto_ai
         self.lock = threading.RLock()
         self.db = sqlite3.connect(":memory:", check_same_thread=False)
         self.db.executescript("""
@@ -57,7 +58,8 @@ class Store:
             invite = secrets.token_urlsafe(18)
             room = {"id": room_id, "title": title, "revision": 1, "status": "open",
                     "invite": invite, "created": time.time(), "members": {}, "segments": [],
-                    "decisions": [], "requests": [], "contributions": [], "history": [], "demo": False}
+                    "decisions": [], "requests": [], "contributions": [], "history": [], "demo": False,
+                    "ai_enabled": self.auto_ai, "analysis": {"status": "idle", "items": [], "summary": "", "phase": "uncertain", "error": ""}}
             room["members"][member] = self.member(name, "host")
             token = self.session(room_id, member, "host")
             board = self.session(room_id, uid("b"), "board")
@@ -100,9 +102,9 @@ class Store:
             if prior:
                 require(prior[0] == fingerprint, "同一命令编号不能用于不同操作", 409)
                 return json.loads(prior[1])
-            before = json.dumps({k: v for k, v in room.items() if k != "members"}, sort_keys=True)
+            before = json.dumps({k: v for k, v in room.items() if k not in {"members", "analysis", "ai_enabled"}}, sort_keys=True)
             result = operation(room)
-            after = json.dumps({k: v for k, v in room.items() if k != "members"}, sort_keys=True)
+            after = json.dumps({k: v for k, v in room.items() if k not in {"members", "analysis", "ai_enabled"}}, sort_keys=True)
             if before != after:
                 room["revision"] += 1
             self.save(room)

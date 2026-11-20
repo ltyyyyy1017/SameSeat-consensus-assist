@@ -4,12 +4,15 @@ import hashlib
 import json
 import urllib.request
 import zipfile
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / ".runtime"
 FILES = {
     "llama.zip": "https://github.com/ggml-org/llama.cpp/releases/download/b12549/llama-b12549-bin-win-cpu-x64.zip",
-    "qwen.gguf": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true",
+    "qwen-1.5b.gguf": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf?download=true",
+    "embedding/model.onnx": "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/onnx/model_quantized.onnx?download=true",
+    "embedding/tokenizer.json": "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/tokenizer.json?download=true",
     **{f"whisper-small/{name}": f"https://huggingface.co/Systran/faster-whisper-small/resolve/main/{name}?download=true"
        for name in ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]},
 }
@@ -41,7 +44,9 @@ def main():
             target = (destination / info.filename).resolve()
             if not target.is_relative_to(destination):
                 raise ValueError('Unsafe archive path')
-        archive.extractall(destination)
+            if target.is_file() and target.stat().st_size == info.file_size and zlib.crc32(target.read_bytes()) == info.CRC:
+                continue
+            archive.extract(info, destination)
     (ROOT / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     print('Local models ready.', flush=True)
 

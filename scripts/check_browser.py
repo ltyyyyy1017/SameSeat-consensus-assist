@@ -1,6 +1,7 @@
 """使用独立无痕上下文验证完整 UI，绝不读取用户浏览器配置。"""
 import json
 import os
+import sys
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -20,9 +21,14 @@ def main():
     OUT.mkdir(exist_ok=True)
     errors = []
     external_requests = []
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tongxi.adapters import LocalTTS
+    sample_path = OUT / 'synthetic-microphone.wav'
+    sample_path.write_bytes(LocalTTS().synthesize('test', {"id": "sample", "rev": 1, "text": "方案需要实验室设备。"}))
     with sync_playwright() as p:
         browser = p.chromium.launch(executable_path='C:/Program Files/Google/Chrome/Application/chrome.exe', headless=True,
-                args=['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'])
+                args=['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
+                      '--use-file-for-fake-audio-capture=' + str(sample_path)])
         context = browser.new_context(viewport={"width": 1440, "height": 1040})
         context.on('page', lambda page: page.on('pageerror', lambda error: errors.append(str(error))))
         context.on('request', lambda request: external_requests.append(request.url)
@@ -58,7 +64,11 @@ def main():
         # 通过真实意见输入与原议题推荐，再交由主持人修改决定。
         subtitle.get_by_role('button', name='写一条补充意见').click()
         subtitle.get_by_label('你想补充什么').fill('周六实验室设备借不到，我建议改成周日。')
-        subtitle.get_by_role('button', name='根据内容查找原议题').click()
+        with subtitle.expect_response('**/matches', timeout=90000) as match_response:
+            subtitle.get_by_role('button', name='根据内容查找原议题').click()
+        match_payload = match_response.value.json()
+        (OUT / 'browser-semantic-match.json').write_text(json.dumps(match_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        assert match_response.value.status == 200 and match_payload.get('items'), match_payload
         subtitle.get_by_role('button', name='校园活动方案 B', exact=True).click()
         subtitle.get_by_role('button', name='提交自己的意见').click()
         subtitle.get_by_text('周六实验室设备借不到，我建议改成周日。', exact=True).wait_for()

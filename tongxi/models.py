@@ -49,6 +49,14 @@ class Version(Input):
     version: int = Field(ge=1)
 
 
+class AICandidate(Decision):
+    why: str = Field(default="", max_length=200)
+
+
+class AISettings(Input):
+    enabled: bool
+
+
 class Presentation(Input):
     epoch: str
     seq: int = Field(ge=1)
