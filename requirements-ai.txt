@@ -1,0 +1,4 @@
+# 仅在接入本地录音转写时安装；模型需另行下载并指定目录。
+faster-whisper==1.2.1
+# PyAV 19 移除了 faster-whisper 1.2.1 使用的 metadata_errors 参数。
+av==16.1.0
