@@ -7,7 +7,11 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({
   '"': '&quot;',
   "'": '&#39;'
 } [c]));
-const id = () => crypto.randomUUID();
+function id() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
 const labels = {
   discussing: '讨论中',
   preparing: '准备定案',

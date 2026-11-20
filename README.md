@@ -112,13 +112,17 @@ tests/
 .\.venv\Scripts\python.exe scripts/check_models.py
 .\.venv\Scripts\python.exe scripts/check_semantic_ai.py
 node scripts/check_client_ai.mjs
-# 启动服务后运行，默认使用本机 Chrome 的独立无痕上下文
+# 若本机没有安装在 Program Files 下的 Chrome，先安装配套的无头 Chromium
+.\.venv\Scripts\python.exe -m playwright install chromium --only-shell
+# 启动服务后运行，脚本在独立浏览器上下文内验证
 .\.venv\Scripts\python.exe scripts/check_browser.py
 ```
 
 结果、界面截图写到 artifacts，未加入版本管理。浏览器检查使用合成摄像头，避免访问真实用户摄像头。模型检查使用本机合成语音，保留真实转写和候选输出。这些结果说明工程链路已接通，参与体验仍需按项目书的 A/B/C 条件开展真实用户试用。
 
 原型的本地小模型会误识别方案字母、时间及其他词语，语义模型也可能提出宽泛或错误的议题。界面因此保留修订原句、手动建项、改选关联与人工确认。首版尚未实现复杂说话人分离、跨房间持久账户和主机重启后的会话恢复。用户理解程度也需本人表达。
+
+若开启转写后没有字幕，先核对浏览器当前使用的输入设备。看到“正在收音”后完整说一句，停顿约一秒，等待本机处理。一次收音可能分成多个片段，开头的短片段可能返回空文本。核对否定词、方案名和日期，必要时在“实时讨论”点“修订”保存原话，再准备定案。
 
 ## 体验新增 AI 能力
 

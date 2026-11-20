@@ -26,7 +26,8 @@ def main():
     sample_path = OUT / 'synthetic-microphone.wav'
     sample_path.write_bytes(LocalTTS().synthesize('test', {"id": "sample", "rev": 1, "text": "方案需要实验室设备。"}))
     with sync_playwright() as p:
-        browser = p.chromium.launch(executable_path='C:/Program Files/Google/Chrome/Application/chrome.exe', headless=True,
+        chrome = Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / 'Google/Chrome/Application/chrome.exe'
+        browser = p.chromium.launch(executable_path=str(chrome) if chrome.is_file() else None, headless=True,
                 args=['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
                       '--use-file-for-fake-audio-capture=' + str(sample_path)])
         context = browser.new_context(viewport={"width": 1440, "height": 1040})
@@ -82,6 +83,7 @@ def main():
         host.get_by_role('button', name='记录处理结果').click()
         board.get_by_text('已确认', exact=True).wait_for()
         board.get_by_text('周日采用方案 B 开展活动', exact=True).wait_for()
+        board.screenshot(path=str(OUT / '公共屏最终结项.png'), full_page=True)
         subtitle.get_by_text('修改决定 · 采纳设备时间建议，改到周日。', exact=True).wait_for()
         host.screenshot(path=str(OUT / '意见处理工作台.png'), full_page=True)
         # 全部主要路由都实际打开，确认存在且无浏览器脚本错误。
