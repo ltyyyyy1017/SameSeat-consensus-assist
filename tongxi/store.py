@@ -69,7 +69,7 @@ class Store:
 
     @staticmethod
     def member(name, role):
-        return {"name": name, "role": role, "consent": {"version": 1, "playback": False, "review": False},
+        return {"name": name, "role": role, "consent": {"version": 1, "playback": False, "review": False, "response_seconds": 20},
                 "presentation": None, "epoch": "", "seq": 0, "heartbeat": 0}
 
     def join(self, invite, name):

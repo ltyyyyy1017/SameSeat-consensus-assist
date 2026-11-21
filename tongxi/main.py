@@ -29,7 +29,7 @@ def create_app(auto_ai=True):
         semantic.close()
         tts.clear()
 
-    app = FastAPI(title="同席 · 房间服务", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="同席 · 房间服务", version="0.2.0", lifespan=lifespan)
     store = Store(auto_ai=auto_ai)
     app.state.store = store
     asr = adapters.LocalASR()
@@ -132,14 +132,15 @@ def create_app(auto_ai=True):
 
     @app.post("/api/v1/rooms/{room}/contributions/{contribution_id}/reply")
     def reply(room: str, contribution_id: str, data: models.Reply, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
-        def handle(r):
-            domain.host(who)
-            c = domain.find(r["contributions"], contribution_id)
-            require(c["status"] == "pending", "意见已处理", 409)
-            c.update(status="handled", resolution={"action": "reply", "reason": data.reason})
-            domain.audit(r, who, "回应意见", {"contribution": c["id"], "reason": data.reason})
-            return c
-        return command(request, room, who, idempotency_key, data, handle)
+        return command(request, room, who, idempotency_key, data, lambda r: domain.reply_contribution(r, who, contribution_id, data))
+
+    @app.post("/api/v1/rooms/{room}/contributions/{contribution_id}/feedback")
+    def contribution_feedback(room: str, contribution_id: str, data: models.ContributionFeedback, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
+        return command(request, room, who, idempotency_key, data, lambda r: domain.contribution_feedback(r, who, contribution_id, data))
+
+    @app.post("/api/v1/rooms/{room}/interventions/feedback")
+    def intervention_feedback(room: str, data: models.InterventionFeedback, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
+        return command(request, room, who, idempotency_key, data, lambda r: domain.intervention_feedback(r, who, data))
 
     @app.post("/api/v1/rooms/{room}/analyze")
     async def analyze(room: str, who=Depends(actor)):
@@ -267,7 +268,7 @@ def create_app(auto_ai=True):
 
     def export_data(room):
         return {"title": room["title"], "demo": room["demo"], "decisions": room["decisions"],
-                "contributions": [{k: c[k] for k in ("id", "text", "decision", "status", "resolution")} for c in room["contributions"]],
+                "contributions": [{k: c[k] for k in ("id", "text", "decision", "status", "resolution", "history", "acknowledged")} for c in room["contributions"]],
                 "segments": [{k: s[k] for k in ("id", "rev", "text")} for s in room["segments"]]}
 
     @app.get("/api/v1/rooms/{room}/export/preview")
@@ -329,7 +330,7 @@ def create_app(auto_ai=True):
             last, cursor = "", 0
             while True:
                 state = domain.snapshot(store.read(room), who)
-                serialized = json.dumps(state, sort_keys=True, ensure_ascii=False)
+                serialized = json.dumps({k: v for k, v in state.items() if k != "server_time"}, sort_keys=True, ensure_ascii=False)
                 if serialized != last:
                     cursor += 1
                     await ws.send_json({"type": "snapshot", "cursor": cursor, "data": state})

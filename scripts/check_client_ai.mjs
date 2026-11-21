@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import {PersonalActionModel} from '../tongxi/web/vision-policy.js';
+import {PersonalActionModel, TemporalActionModel} from '../tongxi/web/vision-policy.js';
+import {InterventionPolicy} from '../tongxi/web/intervention-policy.js';
 import {CaptionMicrophone, encodePcm} from '../tongxi/web/caption-microphone.js';
 
 const model = new PersonalActionModel();
@@ -9,6 +10,23 @@ for (const [label, sample] of Object.entries(examples)) model.train(label, Array
 for (const [label, sample] of Object.entries(examples)) assert.equal(model.predict(sample), label);
 assert.equal(model.predict([10, 10, 10, 10]), null);
 assert.equal(model.predict(examples.speak.map((v, i) => v/2)), null);
+
+const temporal = new TemporalActionModel();
+for (const [label, sample] of Object.entries(examples)) temporal.train(label, Array.from({length: 8}, () => sample));
+assert.equal(temporal.predict([examples.speak]), null, '单帧不能触发连续动作建议');
+assert.equal(temporal.predict(Array.from({length: 8}, () => examples.speak)), 'speak');
+assert.equal(temporal.predict(Array.from({length: 8}, (_, i) => [i*2,0,0,0])), null, '大幅机位变化弃判');
+const policy = new InterventionPolicy();
+const context = {visible:true, online:true, busy:false, hasRequest:false, decisions:[{id:'d1',status:'discussing',evidence:[{segment:'s1',rev:2}]}],receiving:[]};
+assert.equal(policy.decide('speak', context, 0), null, '自由讨论不反复弹出定案提示');
+context.decisions[0].status='preparing';
+context.receiving=[{segment:'s1',rev:2}];
+assert.equal(policy.decide('speak', {...context,hasRequest:true}, 1), null, '已有请求时抑制重复');
+assert.equal(policy.decide('speak', context, 2).kind, 'wait', '仍在接收相关依据时优先留时间');
+assert.equal(policy.decide('speak', context, 3), null, '重复动作进入冷却');
+policy.feedback(false, 4);
+assert.equal(policy.decide('speak', context, 20000), null, '拒绝建议后延长安静时间');
+assert.equal(policy.decide('speak', {...context,receiving:[]}, 40000).kind, 'speak');
 
 globalThis.WebSocket = {OPEN: 1};
 const frames = [], errors = [];

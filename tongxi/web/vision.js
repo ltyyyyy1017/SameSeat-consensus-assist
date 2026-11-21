@@ -1,10 +1,11 @@
 // 视觉特征与视频仅保留在当前端，不含服务端请求。
-import {PersonalActionModel} from '/assets/vision-policy.js';
+import {TemporalActionModel} from '/assets/vision-policy.js';
 export class PrivateVision {
   constructor(notify, onHint = () => {}) {
     this.notify = notify;
     this.onHint = onHint;
-    this.model = new PersonalActionModel();
+    this.model = new TemporalActionModel();
+    this.frames = [];
     this.capture = null;
     this.streak = 0;
     this.previous = null;
@@ -70,12 +71,19 @@ export class PrivateVision {
       const poses = this.pose.detectForVideo(this.video, t).landmarks;
       if (faces.length !== 1 || !poses.length) {
         this.streak = 0;
+        this.frames = [];
+        this.last = null;
+        this.onHint(null);
         this.update('当前画面无法可靠取得本人动作，暂不判断。');
       } else {
         const f = faces[0],
           p = poses[0],
           width = Math.hypot(p[11].x - p[12].x, p[11].y - p[12].y);
         if (width < .08 || Math.min(p[11].visibility, p[12].visibility) < .5) {
+          this.frames = [];
+          this.streak = 0;
+          this.last = null;
+          this.onHint(null);
           this.update('肩部出框或遮挡，请调整机位。');
         } else {
           const mouth = Math.hypot(f[13].x - f[14].x, f[13].y - f[14].y) / Math.max(.01, Math.hypot(f[33].x - f[263].x, f[33].y - f[263].y));
@@ -105,6 +113,12 @@ export class PrivateVision {
     this.baseline = {
       ...this.last
     };
+    this.model = new TemporalActionModel();
+    this.frames = [];
+    this.capture = null;
+    this.streak = 0;
+    this.previous = null;
+    this.onHint(null);
     this.update('自然坐姿已校准，开始比较相对动作。');
   }
   record(label) {
@@ -124,7 +138,9 @@ export class PrivateVision {
       }
       return;
     }
-    const label = this.model.predict(f);
+    this.frames.push(f);
+    this.frames = this.frames.slice(-8);
+    const label = this.model.predict(this.frames);
     this.streak = label && label === this.previous ? this.streak+1 : 0;
     this.previous = label;
     const count = Object.keys(this.model.samples).length;
@@ -146,7 +162,8 @@ export class PrivateVision {
     this.pose = null;
     this.last = null;
     this.baseline = null;
-    this.model = new PersonalActionModel();
+    this.model = new TemporalActionModel();
+    this.frames = [];
     this.capture = null;
     this.onHint(null);
     this.update('摄像头已关闭，短时动作缓存已清除。');
