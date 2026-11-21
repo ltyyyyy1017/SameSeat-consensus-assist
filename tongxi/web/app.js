@@ -48,6 +48,9 @@ const state = {
   review: null,
   selected: new Set(),
   recording: false,
+  recordingStarting: false,
+  recordingStopping: false,
+  captionStatus: '连续收音，停顿后自动生成带标点的字幕。',
   candidate: [],
   autoAnalyze: true,
   analysisBusy: false,
@@ -56,8 +59,6 @@ const state = {
   pendingConsent: null
 };
 let socket, reconnectTimer, toastTimer, microphone, camera;
-const audioQueue = [];
-let audioDraining = false;
 const modal = $('#modal');
 
 function toast(text) {
@@ -362,7 +363,7 @@ function decisionCard(d) {
 function live() {
   const s = state.snapshot,
     host = s.role === 'host';
-  return head('实时讨论', '保持原句可见，让补充能够回到它回应的地方。', host ? `<button class="${state.recording?'recording':''}" data-action="record">${state.recording?'停止录音':'开启本地转写'}</button>` : '') + `<div class="columns"><div>${state.review?`<div class="hint review-banner">正在回看选中的原句<button class="small" data-action="end-review">回到实时位置</button></div>`:''}${panel('讨论原句',`<div class="transcript" id="transcript">${s.segments.length?s.segments.map((seg,i)=>`<article class="segment ${state.review?.segment===seg.id?'selected':''}">${host?`<input type="checkbox" data-evidence="${seg.id}" aria-label="选择第 ${i+1} 句作为决定依据" ${state.selected.has(seg.id)?'checked':''}>`:''}<div class="seg-body"><div class="segment-meta"><span>第 ${i+1} 句</span><span>${seg.source==='asr'?'本地转写':'主持人记录'}</span><span>v${seg.rev}${seg.rev>1?' · 已修订':''}</span>${!seg.stable?'<span>临时字幕</span>':''}</div><p>${esc(seg.text)}</p><div class="seg-tools"><button class="ghost small" data-review="${seg.id}">回看这句</button><button class="ghost small" data-quote="${seg.id}">回应这句</button>${host?`<button class="ghost small" data-edit="${seg.id}">修订</button>`:''}</div></div></article>`).join(''):empty('等待讨论开始','原句会按顺序出现在这里。')}</div>${host?'<div class="panel-body"><form id="segment-form"><label class="form-label" for="segment-input">记录一句讨论原话</label><textarea id="segment-input" name="text" required placeholder="例如：方案 B 需要实验室设备，周六可以使用实验室。" maxlength="1500"></textarea><div class="row between" style="margin-top:12px"><span class="muted small-text">将明确标记为主持人记录</span><button class="primary" type="submit">加入字幕</button></div></form></div>':''}`,`<span class="muted">${s.segments.length} 句</span>`)}${host?`<div class="row"><button data-action="new-decision" class="primary">用选中原句建立议题</button><button data-action="analyze">本地 AI 提议议题</button></div>${suggestionPanel()}`:''}</div><aside>${visionHintPanel()}${playerPanel()}${panel('回应与阅读',`<div class="panel-body"><div class="hint">${s.me.consent.review?'已授权回看留位。你主动选择回看相关依据、主持人准备定案时，系统会替该议题留位。':'点击“回看这句”保留阅读位置。你可以在个人授权里开启相关依据回看时自动留位。'}</div><button class="wide" style="margin-top:15px" data-action="compose">写一条补充意见</button></div>`)}${panel('当前议题',s.decisions.some(d=>d.status!=='confirmed')?s.decisions.filter(d=>d.status!=='confirmed').slice(-2).map(d=>decisionCard(d)).join(''):empty('暂无进行中的议题','主持人可以从原句建立。'))}</aside></div>`;
+  return head('实时讨论', '保持原句可见，让补充能够回到它回应的地方。', host ? `<button class="${state.recording?'recording':''}" data-action="record">${state.recordingStarting?'正在准备字幕…':state.recordingStopping?'正在完成字幕…':state.recording?'停止录音':'开启本地转写'}</button><span id="caption-status" class="muted small-text">${esc(state.captionStatus)}</span>` : '') + `<div class="columns"><div>${state.review?`<div class="hint review-banner">正在回看选中的原句<button class="small" data-action="end-review">回到实时位置</button></div>`:''}${panel('讨论原句',`<div class="transcript" id="transcript">${s.segments.length?s.segments.map((seg,i)=>`<article class="segment ${state.review?.segment===seg.id?'selected':''}">${host?`<input type="checkbox" data-evidence="${seg.id}" aria-label="选择第 ${i+1} 句作为决定依据" ${state.selected.has(seg.id)?'checked':''}>`:''}<div class="seg-body"><div class="segment-meta"><span>第 ${i+1} 句</span><span>${seg.source==='asr'?'本地转写':'主持人记录'}</span><span>v${seg.rev}${seg.rev>1?' · 已修订':''}</span>${!seg.stable?'<span>临时字幕</span>':''}</div><p>${esc(seg.text)}</p><div class="seg-tools"><button class="ghost small" data-review="${seg.id}">回看这句</button><button class="ghost small" data-quote="${seg.id}">回应这句</button>${host?`<button class="ghost small" data-edit="${seg.id}">修订</button>`:''}</div></div></article>`).join(''):empty('等待讨论开始','原句会按顺序出现在这里。')}</div>${host?'<div class="panel-body"><form id="segment-form"><label class="form-label" for="segment-input">记录一句讨论原话</label><textarea id="segment-input" name="text" required placeholder="例如：方案 B 需要实验室设备，周六可以使用实验室。" maxlength="1500"></textarea><div class="row between" style="margin-top:12px"><span class="muted small-text">将明确标记为主持人记录</span><button class="primary" type="submit">加入字幕</button></div></form></div>':''}`,`<span class="muted">${s.segments.length} 句</span>`)}${host?`<div class="row"><button data-action="new-decision" class="primary">用选中原句建立议题</button><button data-action="analyze">本地 AI 提议议题</button></div>${suggestionPanel()}`:''}</div><aside>${visionHintPanel()}${playerPanel()}${panel('回应与阅读',`<div class="panel-body"><div class="hint">${s.me.consent.review?'已授权回看留位。你主动选择回看相关依据、主持人准备定案时，系统会替该议题留位。':'点击“回看这句”保留阅读位置。你可以在个人授权里开启相关依据回看时自动留位。'}</div><button class="wide" style="margin-top:15px" data-action="compose">写一条补充意见</button></div>`)}${panel('当前议题',s.decisions.some(d=>d.status!=='confirmed')?s.decisions.filter(d=>d.status!=='confirmed').slice(-2).map(d=>decisionCard(d)).join(''):empty('暂无进行中的议题','主持人可以从原句建立。'))}</aside></div>`;
 }
 
 function visionHintPanel() {
@@ -392,7 +393,7 @@ function recap() {
 function settings() {
   const s = state.snapshot,
     h = state.health?.capabilities;
-  return head('个人与设备', '选择适合自己的参与方式，随时调整。') + `<div class="columns"><div>${panel('我的自动留位授权',`<div class="panel-body"><form id="consent-form">${consentFields()}<button class="primary" type="submit">保存本场授权</button></form></div>`)}${panel('个人摄像头研究',`<div class="panel-body"><p class="list-note">在本机校准自然坐姿，再分别记录三类由本人示范的动作。系统比较连续动作并给你私人建议，建议可忽略。样例在关闭摄像头时清除。</p><video id="camera-video" class="camera-video" autoplay muted playsinline ${camera?.stream?'':'hidden'}></video><p id="camera-status" class="hint">${esc(camera?.message||'尚未开启，模型资源位于本地。')}</p><div class="actions"><button data-action="camera">${camera?.stream?'关闭摄像头':'授权并开启摄像头'}</button><button data-action="calibrate" ${camera?.stream?'':'disabled'}>校准自然坐姿</button></div><div class="actions"><button class="small" data-vision-sample="listen" ${camera?.stream?'':'disabled'}>记录自然聆听</button><button class="small" data-vision-sample="speak" ${camera?.stream?'':'disabled'}>记录准备发言</button><button class="small" data-vision-sample="wait" ${camera?.stream?'':'disabled'}>记录希望等待</button></div></div>`)}${s.role==='host'?panel('结束本场讨论',`<div class="panel-body"><p class="list-note">结束前请先导出需要保留的决定记录。结束后清空本场原句、意见与临时进度，邀请随即失效。</p><button class="danger" data-action="end">结束并清空房间</button></div>`):''}</div><aside>${playerPanel()}${panel('房间主机能力',`<div class="panel-body"><div class="status-row"><span>中文转写<small>faster-whisper 本地模型</small></span><span class="tag ${h?.asr.ready?'':'neutral'}">${h?.asr.ready?'已配置':'待配置'}</span></div><div class="status-row"><span>语义议题提取<small>${esc(h?.semantic.label||'本地语义模型')}</small></span><span class="tag ${h?.semantic.ready?'':'neutral'}">${h?.semantic.ready?'已配置':'待配置'}</span></div><div class="status-row"><span>语义关联与依据解释</span><span class="tag">可用</span></div><p class="list-note">已配置表示主机设置了模型入口，首次运行仍需验证模型能否加载。手动建项、请求和处理流程可独立使用。</p></div>`)}</aside></div>`;
+  return head('个人与设备', '选择适合自己的参与方式，随时调整。') + `<div class="columns"><div>${panel('我的自动留位授权',`<div class="panel-body"><form id="consent-form">${consentFields()}<button class="primary" type="submit">保存本场授权</button></form></div>`)}${panel('个人摄像头研究',`<div class="panel-body"><p class="list-note">在本机校准自然坐姿，再分别记录三类由本人示范的动作。系统比较连续动作并给你私人建议，建议可忽略。样例在关闭摄像头时清除。</p><video id="camera-video" class="camera-video" autoplay muted playsinline ${camera?.stream?'':'hidden'}></video><p id="camera-status" class="hint">${esc(camera?.message||'尚未开启，模型资源位于本地。')}</p><div class="actions"><button data-action="camera">${camera?.stream?'关闭摄像头':'授权并开启摄像头'}</button><button data-action="calibrate" ${camera?.stream?'':'disabled'}>校准自然坐姿</button></div><div class="actions"><button class="small" data-vision-sample="listen" ${camera?.stream?'':'disabled'}>记录自然聆听</button><button class="small" data-vision-sample="speak" ${camera?.stream?'':'disabled'}>记录准备发言</button><button class="small" data-vision-sample="wait" ${camera?.stream?'':'disabled'}>记录希望等待</button></div></div>`)}${s.role==='host'?panel('结束本场讨论',`<div class="panel-body"><p class="list-note">结束前请先导出需要保留的决定记录。结束后清空本场原句、意见与临时进度，邀请随即失效。</p><button class="danger" data-action="end">结束并清空房间</button></div>`):''}</div><aside>${playerPanel()}${panel('房间主机能力',`<div class="panel-body"><div class="status-row"><span>中文转写<small>${esc(h?.asr.label||'本地字幕组件')}</small></span><span class="tag ${h?.asr.ready?'':'neutral'}">${h?.asr.ready?'已配置':'待配置'}</span></div><div class="status-row"><span>语义议题提取<small>${esc(h?.semantic.label||'本地语义模型')}</small></span><span class="tag ${h?.semantic.ready?'':'neutral'}">${h?.semantic.ready?'已配置':'待配置'}</span></div><div class="status-row"><span>语义关联与依据解释</span><span class="tag">可用</span></div><p class="list-note">已配置表示主机设置了模型入口，首次运行仍需验证模型能否加载。手动建项、请求和处理流程可独立使用。</p></div>`)}</aside></div>`;
 }
 
 function renderBoard() {
@@ -660,49 +661,52 @@ document.addEventListener('visibilitychange', () => {
 });
 
 async function startRecording() {
+  if (state.recordingStarting || state.recordingStopping) return;
   if (!state.health?.capabilities.asr.ready) throw new Error('主机尚未准备本地语音模型');
-  const {PhraseMicrophone} = await import('/assets/microphone.js');
-  microphone = new PhraseMicrophone(blob => {
-    if (state.snapshot?.status !== 'open') return;
-    audioQueue.push(blob);
-    if (audioQueue.length >= 2 && state.recording) {
-      stopRecording();
-      toast('正在处理上一段语音，已暂缓新录音。处理完成后可以继续。');
-    }
-    drainAudio();
-  }, message => toast(message));
-  await microphone.start();
-  state.recording = true;
+  state.recordingStarting = true;
   render();
-}
-
-async function drainAudio() {
-  if (audioDraining) return;
-  audioDraining = true;
-  while (audioQueue.length && state.snapshot?.status === 'open') {
-    const blob = audioQueue.shift();
-    try {
-      const result = await api(route('/audio'), blob, 'POST', true);
-      if (result.text) await change('/segments', {
-        text: result.text,
-        source: 'asr',
-        stable: true
-      });
-    } catch (e) {
-      audioQueue.length = 0;
-      stopRecording();
-      toast(e.message);
-      break;
-    }
+  try {
+    const {CaptionMicrophone} = await import('/assets/caption-microphone.js');
+    const url = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/v1${route('/caption-stream')}`;
+    const capture = new CaptionMicrophone({url, token: state.session.token,
+      onStatus: message => {
+        state.captionStatus = message;
+        const label = $('#caption-status');
+        if (label) label.textContent = message;
+      },
+      onError: error => {
+        if (microphone !== capture) return;
+        state.recording = false;
+        state.captionStatus = error.message;
+        microphone = null;
+        render();
+        toast(error.message);
+      }});
+    microphone = capture;
+    await capture.start();
+    if (state.snapshot?.status !== 'open') {capture.abort(); return;}
+    state.recording = true;
+  } finally {
+    state.recordingStarting = false;
+    render();
   }
-  audioDraining = false;
 }
 
-function stopRecording() {
+async function stopRecording() {
+  if (state.recordingStopping) return;
+  const capture = microphone;
   state.recording = false;
-  microphone?.stop(state.snapshot?.status === 'open');
-  microphone = null;
+  state.recordingStopping = true;
   render();
+  try {
+    if (state.snapshot?.status === 'open') await capture?.stop();
+    else capture?.abort();
+  } catch (error) {state.captionStatus = error.message; toast(error.message);}
+  finally {
+    if (microphone === capture) microphone = null;
+    state.recordingStopping = false;
+    render();
+  }
 }
 
 document.addEventListener('change', event => {
@@ -864,7 +868,8 @@ document.addEventListener('click', async event => {
     }
     if (action === 'speech-replay') await speech.replay();
     if (action === 'record') {
-      if (state.recording) stopRecording();
+      if (state.recordingStarting || state.recordingStopping) return;
+      if (state.recording) await stopRecording();
       else await startRecording();
     }
     if (action === 'auto-analyze') {
@@ -1014,6 +1019,7 @@ async function init() {
   home();
 }
 window.addEventListener('beforeunload', () => {
+  microphone?.abort();
   camera?.stop();
   window.speechSynthesis?.cancel();
 });

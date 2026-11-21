@@ -4,6 +4,7 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -32,6 +33,8 @@ def create_app(auto_ai=True):
     store = Store(auto_ai=auto_ai)
     app.state.store = store
     asr = adapters.LocalASR()
+    app.state.asr = asr
+    active_audio = {}
     analysis = AnalysisService(store, semantic)
     app.state.analysis = analysis
 
@@ -183,7 +186,84 @@ def create_app(auto_ai=True):
             size += len(chunk)
             require(size <= 12_000_000, "录音片段过大", 413)
             chunks.append(chunk)
-        return {"text": await run_in_threadpool(asr.transcribe, b"".join(chunks))}
+        text = await run_in_threadpool(asr.transcribe, b"".join(chunks))
+        from .asr import split_sentences
+        return {"text": text, "sentences": split_sentences(text), "provider": adapters.asr_capabilities()['label']}
+
+    @app.websocket('/api/v1/rooms/{room}/caption-stream')
+    async def caption_stream(ws: WebSocket, room: str):
+        """只桥接收音、官方 VAD/ASR 与已有原句接口，不另做语音算法。"""
+        origin = ws.headers.get('origin')
+        if origin and urlparse(origin).netloc != ws.headers.get('host'):
+            await ws.close(code=1008)
+            return
+        await ws.accept()
+        lease, session = object(), None
+
+        async def publish(texts, who):
+            items = []
+            for text in texts:
+                data = models.Segment(text=text, source='asr', stable=True)
+                result = store.mutate(room, who, str(uuid4()), {'asr': data.model_dump()},
+                                      lambda r, data=data: domain.add_segment(r, who, data))
+                items.append(result)
+            if items:
+                await ws.send_json({'type': 'sentences', 'items': items})
+                await analysis.trigger(room)
+
+        try:
+            hello = await asyncio.wait_for(ws.receive_json(), timeout=8)
+            require(isinstance(hello, dict), '需要有效的录音连接消息')
+            who = store.auth(str(hello.get('token', '')), room)
+            domain.host(who)
+            require(hello.get('sample_rate') == 16000, '字幕组件只接收 16 kHz 单声道 PCM')
+            require(store.read(room)['status'] == 'open', '房间已结束', 410)
+            require(room not in active_audio, '本场已有一台设备正在收音，请先停止另一端', 409)
+            require(len(active_audio) < 2, '本地主机正在处理其他录音，请稍后再试', 429)
+            active_audio[room] = lease
+            await ws.send_json({'type': 'loading', 'message': '正在加载本地字幕组件'})
+            session = await run_in_threadpool(app.state.asr.new_stream)
+            await ws.send_json({'type': 'ready', 'provider': adapters.asr_capabilities()['label']})
+            frames = 0
+            while True:
+                message = await asyncio.wait_for(ws.receive(), timeout=30)
+                if message['type'] == 'websocket.disconnect':
+                    break
+                require(store.read(room)['status'] == 'open', '房间已结束', 410)
+                # 每帧重新核对会话有效期；音频连接不改变成员的呈现连接代次。
+                store.auth(str(hello.get('token', '')), room)
+                if message.get('bytes') is not None:
+                    pcm = message['bytes']
+                    require(0 < len(pcm) <= 32768 and len(pcm) % 2 == 0, '音频帧格式或大小无效')
+                    texts = await run_in_threadpool(session.accept_pcm, pcm)
+                    await publish(texts, who)
+                    frames += 1
+                    await ws.send_json({'type': 'ack', 'frames': frames})
+                else:
+                    control = json.loads(message.get('text') or '{}')
+                    require(isinstance(control, dict) and control.get('type') == 'stop', '不支持的录音命令')
+                    await publish(await run_in_threadpool(session.finish), who)
+                    await ws.send_json({'type': 'done'})
+                    await ws.close(code=1000)
+                    break
+        except (HTTPException, asyncio.TimeoutError, ValueError, TypeError) as error:
+            try:
+                detail = error.detail if isinstance(error, HTTPException) else '录音连接超时或消息无效，请重新开启字幕'
+                await ws.send_json({'type': 'error', 'message': detail})
+                await ws.close(code=1008)
+            except (RuntimeError, WebSocketDisconnect):
+                pass
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            try:
+                await ws.send_json({'type': 'error', 'message': '本地字幕组件处理失败，请检查模型和收音后重新开启'})
+                await ws.close(code=1011)
+            except (RuntimeError, WebSocketDisconnect):
+                pass
+        finally:
+            if active_audio.get(room) is lease:
+                active_audio.pop(room, None)
 
     def export_data(room):
         return {"title": room["title"], "demo": room["demo"], "decisions": room["decisions"],

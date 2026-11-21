@@ -26,7 +26,7 @@ Same‑Seat: An inclusive decision‑making assistant for university group delib
 |---|---|
 | 房间和身份 | 限时邀请、主持／成员／公共屏独立凭证，凭证放 URL 片段并立即清除；会话仅保留在对应标签页的 sessionStorage |
 | 完整前端 | 首页、概览、实时字幕、议题与决定、回应工作台、复盘、个人与设备；手机适配、键盘操作、表单校验、错误与重连提示 |
-| 字幕 | 主持人记录、原句修订和版本引用、本地麦克风分段转写、主动回看与原位阅读 |
+| 字幕 | 主持人记录、原句修订和版本引用、sherpa-onnx + SenseVoice 中文转写、Silero VAD 自动端点及标点分句、主动回看与原位阅读 |
 | 播报 | Windows 本机中文音色合成 WAV，成员端真实音频队列及播放事件，停止、重播、调速；音频仅在内存缓存 |
 | 议题提取 | 服务端自动队列驱动本地 Qwen，显示讨论阶段、摘要、原句依据与耗时；修订时丢弃旧结果，主持人核对后建立议题 |
 | 自动留位 | 按成员授权、定案轮次、有效原句版本、队列或主动回看状态联合判断；公共卡按议题聚合 |
@@ -50,15 +50,15 @@ py -m venv .venv
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1
 ```
 
-首次准备会下载约 1.8 GB 的模型和 CPU 运行文件到工作区内，已有完整文件会跳过。安装依赖和下载需要网络，日常运行只访问本机及当前局域网。下载失败后重新运行对应脚本即可。脚本先写临时文件，再替换成正式文件，并记录来源与 SHA-256 清单。
+首次准备会将语义、语音、视觉模型与 CPU 运行文件下载到工作区内，已有完整文件会跳过。安装依赖和下载需要网络，日常运行只访问本机及当前局域网。下载失败后重新运行对应脚本即可。脚本先写临时文件，再替换成正式文件，并记录来源与 SHA-256 清单。
 
-本次为了在现有环境直接运行，前端采用原生 ES Modules、HTML 和 CSS，无需 Node 包管理器和构建步骤。源代码均位于 tongxi/web。服务端转写使用 faster-whisper 的分段接口，视觉模块与模型均预置本地。详细部署形态与原架构中的转写和 TypeScript 候选方案略有调整。
+本次为了在现有环境直接运行，前端采用原生 ES Modules、HTML 和 CSS，无需 Node 包管理器和构建步骤。源代码均位于 tongxi/web。服务端转写复用 sherpa-onnx 的 SenseVoice 与 Silero VAD，视觉模块与模型均预置本地。详细部署形态与原架构中的转写和 TypeScript 候选方案略有调整。
 
 ### 本地 AI 选择
 
 - **语义**优先识别 .runtime/qwen-1.5b.gguf，兼容已有的 qwen.gguf。第一次分析时启动 .runtime/llama/llama-server.exe 独立 CPU 进程，监听随机回环端口，应用正常退出时关闭。预置模型为 Qwen2.5-1.5B-Instruct Q4_K_M。若使用已有 Ollama，可设置 TONGXI_MODEL 为实际本地模型名，服务改用 127.0.0.1:11434。两种入口均绕过代理，避免本机请求意外送到代理服务器。
 - **关联检索**使用 .runtime/embedding 中的多语言 MiniLM ONNX 模型，按语义召回候选，再由本地语言模型逐一判断。无法运行语义服务时明确标记词组检索降级。模型判断仍可能出错，提交前保留改选和独立意见入口。
-- **转写**优先使用 .runtime/whisper-small，也可将 TONGXI_ASR_MODEL 设置为其他已下载目录。浏览器 AudioWorklet 连续采集 PCM，保留短时前缓冲，在约 650 毫秒停顿后提交 WAV，长句最长约八秒分段，纯静音不提交。后端再次用 VAD 与无语音概率过滤。实际延迟包含等待停顿和模型推理，噪声中仍需验证。
+- **转写**复用 sherpa-onnx 1.13.8、SenseVoiceSmall int8 与 Silero VAD，资源位于 .runtime/asr。浏览器持续发送 16 kHz PCM，由官方 VAD 检测停顿，再输出带标点的中文，并按句号、问号、叹号建立独立原句。停止时提交尾帧并等待最后一句；不再按八秒硬切或因排队两段而自动停录。当前属于停顿后出句，不提供逐字临时字幕；快语速、含糊发音和噪声表现仍需实际使用验收。已有其他目录时，TONGXI_ASR_MODEL 须指向包含 model.int8.onnx、tokens.txt、silero_vad.onnx 的目录。详见 [字幕底座选型与接入](docs/字幕底座选型与接入.md)。
 - **中文播报**使用 Windows 的中文 System.Speech 音色。本机已确认有 Microsoft Huihui Desktop。其他 Windows 主机如缺失中文音色，需先通过系统设置安装。成员设备只需能够播放 WAV。
 - **视觉**依赖 assets/vendor 的本地 WASM 与 task 文件。浏览器拒绝摄像头时仍能使用全部 P0 功能。
 
@@ -82,19 +82,21 @@ tongxi/
   domain.py        授权、原句修订、留位、请求与决定状态机
   analysis.py      服务端自动分析任务、状态通知与旧结果失效
   embeddings.py    本地 ONNX 句向量和候选召回
-  adapters.py      本地语音、转写、语义和词组检索
+  adapters.py      本地播报、语义和词组检索
+  asr.py           sherpa-onnx 识别与官方 VAD 会话，模型标点分句
   web/
     index.html     本地页面入口
     app.js         三端页面、自动候选、播放器与交互
     style.css      桌面与手机界面
     vision.js      端侧视觉生命周期及特征显示
     vision-policy.js 个人动作样例、弃判与私人提示
-    microphone.js  连续收音、语音停顿分段与 WAV 编码
+    caption-microphone.js  连续 PCM 传输、处理回执与尾帧提交
     pcm-worklet.js 浏览器音频采集处理器
     vendor/        下载的本地视觉资源与来源清单
 scripts/
   start.ps1        启动本地／局域网服务
   setup_models.py  准备 Windows CPU 模型资源
+  setup_asr.py     下载现成字幕模型、VAD 与上游许可证
   setup_vision.py  准备浏览器视觉资源
   check_browser.py 四端交互、手机与媒体模块浏览器检查
   check_models.py  合成中文音频和真实本地推理检查
@@ -127,3 +129,7 @@ node scripts/check_client_ai.mjs
 成员提交补充前，点击“根据内容查找原议题”。系统先在本机计算语义向量，再比较补充与各项议题，展示候选关系及原句。引用无效、结构不合规或解释与关联标记冲突的结果会被舍弃。语言模型没有确认、但向量召回较接近时，明确标为“可能回应的上下文”，交给本人核对。当前模型的关系标签和解释仍可能错误，含糊指代也可能没有结果。构造案例验证仅覆盖小规模归属回归，仍需积累真实讨论中的误判与漏判。
 
 视觉功能在“个人与设备”中开启。先校准自然坐姿，再分别保持三类动作两秒完成样例记录。示例匹配会在连续几帧一致时给出私人快捷建议，用户可选择请求或忽略。该原型使用个人示例中心匹配，不具有经过真实用户实验验证的普适意图识别准确率。
+
+## 字幕底座与原创范围
+
+语音识别、VAD 和标点输出采用 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 的 SenseVoice 与 Silero VAD 接入。本项目重点实现议题依据、授权留位、原句版本与回应处理，字幕识别不作为原创算法贡献。选型、接入方式和已检查的边界见 [说明文档](docs/字幕底座选型与接入.md)。已有环境仅更新字幕组件时，执行 `.\.venv\Scripts\python.exe scripts/setup_asr.py`。

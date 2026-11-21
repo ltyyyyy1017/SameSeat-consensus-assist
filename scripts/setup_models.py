@@ -13,8 +13,6 @@ FILES = {
     "qwen-1.5b.gguf": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf?download=true",
     "embedding/model.onnx": "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/onnx/model_quantized.onnx?download=true",
     "embedding/tokenizer.json": "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/tokenizer.json?download=true",
-    **{f"whisper-small/{name}": f"https://huggingface.co/Systran/faster-whisper-small/resolve/main/{name}?download=true"
-       for name in ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]},
 }
 
 
@@ -48,6 +46,8 @@ def main():
                 continue
             archive.extract(info, destination)
     (ROOT / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    from setup_asr import main as prepare_asr
+    prepare_asr()
     print('Local models ready.', flush=True)
 
 

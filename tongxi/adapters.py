@@ -1,5 +1,4 @@
 """可选本地推理接入。未配置模型时明确返回 unavailable。"""
-import io
 import json
 import os
 import re
@@ -16,14 +15,10 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from .store import require
+from .asr import LocalASR, asr_capabilities
 
 RUNTIME = Path(__file__).resolve().parents[1] / ".runtime"
 LOCAL_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
-def asr_model_path():
-    preferred = RUNTIME / "whisper-small"
-    return os.getenv("TONGXI_ASR_MODEL", str(preferred if (preferred / "model.bin").is_file() else RUNTIME / "whisper"))
 
 
 def native_model_ready():
@@ -35,33 +30,10 @@ def native_model_path():
     return preferred if preferred.is_file() else RUNTIME / "qwen.gguf"
 
 def capabilities():
-    return {"asr": {"ready": Path(asr_model_path(), "model.bin").is_file(), "label": "本地 faster-whisper"},
+    return {"asr": asr_capabilities(),
             "semantic": {"ready": bool(os.getenv("TONGXI_MODEL")) or native_model_ready(), "label": "本地 Ollama" if os.getenv("TONGXI_MODEL") else "本地 Qwen 1.5B" if native_model_path().name == "qwen-1.5b.gguf" else "本地 Qwen 0.5B"},
             "tts": {"ready": platform.system() == "Windows", "label": "Windows 本机中文语音"},
             "matching": "本地语义关联，失败时使用词组检索", "storage": "内存 SQLite；重启清空"}
-
-
-class LocalASR:
-    def __init__(self):
-        self.model = None
-        self.lock = threading.Lock()
-
-    def transcribe(self, audio):
-        path = asr_model_path()
-        require(bool(path) and Path(path).is_dir(), "请先配置 TONGXI_ASR_MODEL 为已下载的本地模型目录", 503)
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            raise HTTPException(503, "请先安装 requirements-ai.txt 中的转写依赖")
-        with self.lock:
-            if self.model is None:
-                self.model = WhisperModel(path, device="cpu", compute_type="int8", local_files_only=True)
-            try:
-                segments, _ = self.model.transcribe(io.BytesIO(audio), language="zh", vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 450}, condition_on_previous_text=False)
-                return "".join(s.text for s in segments if s.no_speech_prob < .65 and s.avg_logprob > -1).strip()
-            except Exception:
-                raise HTTPException(422, "无法解码这段录音，请检查格式或收音")
 
 
 class LocalSemantic:

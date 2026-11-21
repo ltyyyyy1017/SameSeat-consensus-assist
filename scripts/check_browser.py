@@ -92,13 +92,15 @@ def main():
         host.get_by_role('heading', name='本地 AI 候选议题', exact=True).wait_for()
         host.locator('[data-candidate]').first.wait_for(timeout=90000)
         host.screenshot(path=str(OUT / '实时讨论与AI候选.png'), full_page=True)
-        # 合成麦克风只验证浏览器录音容器到本地转写接口，无需真实用户录音。
+        # 合成麦克风验证连续 PCM → 官方 VAD/ASR → 房间字幕，不访问真实麦克风。
         host.get_by_role('button', name='开启本地转写', exact=True).click()
         host.get_by_role('button', name='停止录音', exact=True).wait_for()
-        host.wait_for_timeout(1000)
-        with host.expect_response('**/audio', timeout=60000) as audio_result:
-            host.get_by_role('button', name='停止录音', exact=True).click()
-        assert audio_result.value.status == 200
+        host.wait_for_timeout(4500)
+        host.get_by_role('button', name='停止录音', exact=True).click()
+        host.get_by_role('button', name='开启本地转写', exact=True).wait_for(timeout=60000)
+        host.get_by_text('收音已停止，最后一句已处理', exact=True).wait_for(timeout=5000)
+        latest = context.request.get(f'{BASE}/api/v1/rooms/{room}/snapshot', headers=auth).json()
+        assert any(s['source'] == 'asr' and s['text'].strip() for s in latest['segments']), latest
         host.get_by_role('button', name='个人与设备', exact=True).click()
         # 只使用浏览器合成摄像头，验证模型能初始化与退出。
         host.get_by_role('button', name='授权并开启摄像头').click()
@@ -118,7 +120,7 @@ def main():
         assert not errors, errors
         assert not external_requests, external_requests
         result = {"four_client_lifecycle": "passed", "mobile_overflow": "passed", "local_tts_playback": "passed",
-                  "local_ai_candidate": "passed", "synthetic_microphone_upload": "passed", "external_page_requests": external_requests,
+                  "local_ai_candidate": "passed", "synthetic_microphone_continuous_captions": "passed", "external_page_requests": external_requests,
                   "local_vision_initialization_synthetic_camera": "passed", "page_errors": errors,
                   "screenshots": [x.name for x in OUT.glob('*.png')]}
         (OUT / 'browser-check.json').write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
