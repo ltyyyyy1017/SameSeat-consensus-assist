@@ -7,9 +7,10 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     throw 'Please create .venv with CPython 3.12+ and install requirements.txt first. See README.md.'
 }
 $listenAddress = if ($Lan) { '0.0.0.0' } else { '127.0.0.1' }
-$funasrPython = if ($env:TONGXI_FUNASR_PYTHON) { $env:TONGXI_FUNASR_PYTHON } else { 'D:\challenge_AI\SameSeat\03_语音评测\ASR接入测试\venvs\funasr\Scripts\python.exe' }
-$funasrServer = if ($env:TONGXI_FUNASR_SERVER) { $env:TONGXI_FUNASR_SERVER } else { 'D:\challenge_AI\SameSeat\03_语音评测\ASR接入测试\sources\FunASR\runtime\python\websocket\funasr_wss_server.py' }
-$funasrCache = if ($env:TONGXI_FUNASR_CACHE) { $env:TONGXI_FUNASR_CACHE } else { 'D:\challenge_AI\SameSeat\03_语音评测\ASR接入测试\cache\modelscope' }
+$funasrRoot = if ($env:TONGXI_FUNASR_ROOT) { $env:TONGXI_FUNASR_ROOT } else { Join-Path $projectRoot '..\03_语音评测\ASR接入测试' }
+$funasrPython = if ($env:TONGXI_FUNASR_PYTHON) { $env:TONGXI_FUNASR_PYTHON } else { Join-Path $funasrRoot 'venvs\funasr\Scripts\python.exe' }
+$funasrServer = if ($env:TONGXI_FUNASR_SERVER) { $env:TONGXI_FUNASR_SERVER } else { Join-Path $funasrRoot 'sources\FunASR\runtime\python\websocket\funasr_wss_server.py' }
+$funasrCache = if ($env:TONGXI_FUNASR_CACHE) { $env:TONGXI_FUNASR_CACHE } else { Join-Path $funasrRoot 'cache\modelscope' }
 $funasrUp = $false
 try {
     $probe = New-Object System.Net.Sockets.TcpClient

@@ -1,3 +1,6 @@
+import {requestCard, contributionCard, openOpinions, outcomes} from '/assets/response-flow.js';
+import {InterventionPolicy} from '/assets/intervention-policy.js';
+const interventionPolicy = new InterventionPolicy();
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({
@@ -27,7 +30,10 @@ const labels = {
   expired: '已失效',
   ignored: '已忽略',
   invalidated: '依据已修订',
-  pending: '等待处理'
+  pending: '等待答复',
+  verifying: '核实中',
+  disputed: '要求继续回应',
+  overridden: '主持人说明后继续'
 };
 const kinds = {
   wait: '请等我读／听完',
@@ -54,6 +60,9 @@ const state = {
   review: null,
   selected: new Set(),
   recording: false,
+  recordingStarting: false,
+  recordingStopping: false,
+  captionStatus: '连续收音，停顿后自动生成带标点的字幕。',
   candidate: [],
   autoAnalyze: true,
   analysisBusy: false,
@@ -141,6 +150,7 @@ async function change(path, body, method) {
 async function reload() {
   if (state.session) {
     state.snapshot = await api(route('/snapshot'));
+    state.clockOffset = state.snapshot.server_time * 1000 - Date.now();
     applyServerAnalysis();
     render();
   }
@@ -346,6 +356,22 @@ function render() {
     $('#camera-video').srcObject = camera.stream;
     $('#camera-video').play().catch(() => {});
   }
+  updateResponseClocks();
+}
+
+function updateResponseClocks() {
+  $$('[data-window-until]').forEach(el => {
+    const seconds = Math.max(0, Math.ceil((Number(el.dataset.windowUntil) * 1000 - Date.now() - (state.clockOffset || 0)) / 1000));
+    el.textContent = seconds ? `至少再保留 ${seconds} 秒准备时间；需要时可延长。` : '准备时间已满足，回应机会仍保留，等待你的选择。';
+  });
+}
+setInterval(updateResponseClocks, 1000);
+
+function responseProgressPanel() {
+  const s = state.snapshot;
+  const mine = s.requests.filter(q => q.member === s.me.id && ['delivered','seen'].includes(q.status));
+  if (!mine.length) return '';
+  return panel('我的回应机会', `<div class="panel-body">${mine.map(q => requestCard(q, s, esc, tag, kinds)).join('')}</div>`);
 }
 
 function head(title, sub, tools = '') {
@@ -459,7 +485,7 @@ function responses() {
 
 function recap() {
   const s = state.snapshot;
-  return head('讨论复盘', '对照当时依据，查看每个决定如何被补充与修订。', s.role === 'host' ? '<button class="primary" data-action="export">预览并导出</button>' : '') + `<div class="columns"><div>${panel('决定处理记录',s.decisions.some(d=>d.resolutions.length)?`<div class="panel-body"><div class="timeline">${s.decisions.flatMap(d=>d.resolutions.map(r=>({d,r}))).sort((a,b)=>a.r.at-b.r.at).map(({d,r})=>`<article class="timeline-item"><time>${new Date(r.at*1000).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</time><strong>${esc(d.title)} · ${actions[r.action]}</strong><p>${esc(r.reason)}</p><div class="quote">${esc(r.after)}</div></article>`).join('')
+  return head('讨论复盘', '对照当时依据，查看每个决定如何被补充与修订。', s.role === 'host' ? '<button class="primary" data-action="export">预览并导出</button>' : '') + `<div class="columns"><div>${panel('决定处理记录',s.decisions.some(d=>d.resolutions.length)?`<div class="panel-body"><div class="timeline">${s.decisions.flatMap(d=>d.resolutions.map(r=>({d,r}))).sort((a,b)=>a.r.at-b.r.at).map(({d,r})=>`<article class="timeline-item"><time>${new Date(r.at*1000).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</time><strong>${esc(d.title)} · ${actions[r.action]}</strong><p>${esc(r.reason)}</p><div class="decision-diff"><div><small>原决定</small><p>${esc(r.before)}</p></div><div><small>处理后</small><p>${esc(r.after)}</p></div></div>${r.continued_without_response?'<div class="hint amber">主持人记录原因后继续；尚未答复的意见仍保留。</div>':''}</article>`).join('')
 }</div></div>`:empty('尚无处理记录','主持人处理议题后，这里会显示理由和结果。'))}</div><aside>${panel('本场记录',`<div class="panel-body"><div class="status-row"><span>讨论原句</span><b>${s.segments.length} 句</b></div><div class="status-row"><span>已提交补充</span><b>${s.contributions.length} 条</b></div><div class="status-row"><span>已确认议题</span><b>${s.decisions.filter(d=>d.status==='confirmed').length} 项</b></div><p class="list-note">导出前可以预览完整内容。个人进度、授权详情、设备信息和原始媒体不进入导出文件。房间结束时清除临时内容。</p></div>`)}</aside></div>`;
 }
 
@@ -535,7 +561,7 @@ function newDecision(prefill) {
 
 function resolveDialog(decisionId, action = 'maintain') {
   const d = decisionById(decisionId);
-  showDialog('处理议题与回应', `<div class="hint">${esc(d.title)}<br>${esc(d.conclusion)}</div><div class="field" style="margin-top:20px"><label class="form-label" for="resolve-action">如何处理</label><select id="resolve-action" name="action">${(action==='reopen'?['reopen']:['maintain','modify','defer']).map(a=>`<option value="${a}" ${action===a?'selected':''}>${actions[a]}</option>`).join('')}</select></div><div class="field"><label class="form-label" for="new-conclusion">修改后的结论（选择修改时填写）</label><input id="new-conclusion" name="conclusion" value="${esc(d.conclusion)}" maxlength="300"></div><div class="field"><label class="form-label" for="resolve-reason">处理理由／回应说明</label><textarea id="resolve-reason" name="reason" required maxlength="1000" placeholder="例如：采纳设备时间建议，活动改到周日。"></textarea></div><label class="check-row"><input type="checkbox" name="close_pending"><span>若仍有未回应事项，记录上述理由后继续确认<small>仍未回应的成员将收到该处理说明。</small></span></label>${modalButtons('记录处理结果')}`, async data => {
+  showDialog('处理议题与回应', `<div class="hint">${esc(d.title)}<br>${esc(d.conclusion)}</div><p class="list-note">确认决定不会自动答复意见。仍待答复：${state.snapshot.contributions.filter(c=>c.decision===d.id&&openOpinions(c)).length} 条。</p><div class="field" style="margin-top:20px"><label class="form-label" for="resolve-action">如何处理</label><select id="resolve-action" name="action">${(action==='reopen'?['reopen']:['maintain','modify','defer']).map(a=>`<option value="${a}" ${action===a?'selected':''}>${actions[a]}</option>`).join('')}</select></div><div class="field"><label class="form-label" for="new-conclusion">修改后的结论（选择修改时填写）</label><input id="new-conclusion" name="conclusion" value="${esc(d.conclusion)}" maxlength="300"></div><div class="field"><label class="form-label" for="resolve-reason">处理理由／回应说明</label><textarea id="resolve-reason" name="reason" required maxlength="1000" placeholder="例如：采纳设备时间建议，活动改到周日。"></textarea></div><label class="check-row"><input type="checkbox" name="close_pending"><span>若仍有未回应事项，记录上述理由后继续确认<small>请求将标记为“说明后继续”，未答复意见继续保留；不表示成员同意。</small></span></label>${modalButtons('记录处理结果')}`, async data => {
     await change(`/decisions/${d.id}/resolve`, {
       version: d.version,
       action: data.get('action'),
@@ -545,6 +571,28 @@ function resolveDialog(decisionId, action = 'maintain') {
     });
     modal.close();
     toast('处理结果已同步给参与者');
+  });
+}
+
+function replyDialog(cid) {
+  const c = state.snapshot.contributions.find(c=>c.id===cid);
+  showDialog('逐条答复意见', `<div class="quote">${esc(c.text)}</div><div class="field"><label class="form-label" for="reply-outcome">这条意见如何处理</label><select id="reply-outcome" name="outcome">${Object.entries(outcomes).map(([key,label])=>`<option value="${key}">${label}</option>`).join('')}</select></div><div class="field"><label class="form-label" for="reply-text">针对这条意见的答复</label><textarea id="reply-text" name="reason" required maxlength="1000"></textarea></div><div class="field"><label class="form-label" for="reply-impact">具体影响或采纳范围（采纳时必填）</label><textarea id="reply-impact" name="impact" maxlength="1000" placeholder="例如：活动日期拟改为周日；请另在议题中记录最终修改。"></textarea></div><p class="list-note">此操作只答复这条意见。需要修改共同决定时，请另行处理议题。</p>${modalButtons('发送这条答复')}`, async data=>{
+    await change(`/contributions/${cid}/reply`, {version:c.version, outcome:data.get('outcome'), reason:data.get('reason'), impact:data.get('impact')});
+    modal.close();
+    toast('这条意见的答复已送达');
+  });
+}
+
+async function opinionFeedbackDialog(cid, action) {
+  const c = state.snapshot.contributions.find(c=>c.id===cid);
+  if (action === 'acknowledge') {
+    await change(`/contributions/${cid}/feedback`, {version:c.version, action});
+    return;
+  }
+  showDialog('要求继续回应', `<div class="quote">${esc(c.text)}</div><label class="form-label" for="dispute-reason">哪些问题还没有得到回答</label><textarea id="dispute-reason" name="reason" required maxlength="1000"></textarea>${modalButtons('发回主持人继续回应')}`, async data=>{
+    await change(`/contributions/${cid}/feedback`, {version:c.version, action, reason:data.get('reason')});
+    modal.close();
+    toast('已请求继续回应；原答复仍保留在记录中');
   });
 }
 
@@ -584,6 +632,7 @@ const speech = {
   active: false,
   queue: [],
   done: new Set(),
+  completed: new Map(),
   current: null,
   instance: '',
   message: '开启后，由房间主机离线生成中文语音。',
@@ -647,6 +696,7 @@ const speech = {
       this.audio.onended = () => {
         if (this.current !== current) return;
         this.done.add(current.key);
+        this.completed.set(current.key, {segment: current.id, rev: current.rev});
         this.active = false;
         this.current = null;
         this.cancelAudio();
@@ -694,6 +744,7 @@ const speech = {
   replay() {
     this.stop();
     this.done.clear();
+    this.completed.clear();
     return this.start();
   }
 };
@@ -724,7 +775,9 @@ async function reportProgress() {
       consent_version: state.snapshot.me.consent.version,
       evidence: refs,
       state: mode,
-      instance
+      instance,
+      completed: state.snapshot.me.consent.playback ? [...speech.completed.values()].filter(e=>segmentById(e.segment)?.rev===e.rev).slice(-150) : [],
+      review_completed: state.snapshot.me.consent.review ? [...state.reviewed.values()].filter(e=>segmentById(e.segment)?.rev===e.rev).slice(-150) : []
     });
   } catch {
     /* 过期回执由下一次当前状态刷新替代。 */
@@ -749,6 +802,15 @@ function stopRecording() {
   microphone?.stop();
   microphone = null;
   render();
+  try {
+    if (state.snapshot?.status === 'open') await capture?.stop();
+    else capture?.abort();
+  } catch (error) {state.captionStatus = error.message; toast(error.message);}
+  finally {
+    if (microphone === capture) microphone = null;
+    state.recordingStopping = false;
+    render();
+  }
 }
 
 document.addEventListener('change', event => {
@@ -805,6 +867,16 @@ document.addEventListener('click', async event => {
   const button = event.target.closest('button');
   if (!button) return;
   try {
+    if (button.hasAttribute('data-accept-hint')) {
+      const hint = state.visionHint;
+      if (!hint) return;
+      await change('/requests', {kind:hint.kind, decision:hint.decision});
+      interventionPolicy.feedback(true);
+      state.visionHint=null;
+      render();
+      toast('你的请求已送达主持人');
+      return;
+    }
     if (button.dataset.visionSample) {camera?.record(button.dataset.visionSample);return;}
     if (button.dataset.view) {
       state.view = button.dataset.view;
@@ -830,6 +902,7 @@ document.addEventListener('click', async event => {
     }
     if (button.dataset.review) {
       const s = segmentById(button.dataset.review);
+      state.reviewed.delete(`${s.id}:${s.rev}`);
       state.review = {
         segment: s.id,
         rev: s.rev
@@ -871,20 +944,29 @@ document.addEventListener('click', async event => {
       return;
     }
     if (button.dataset.reply) {
-      const cid = button.dataset.reply;
-      showDialog('回复独立意见', `<div class="field"><label class="form-label" for="reply-text">回应说明</label><textarea id="reply-text" name="reason" required maxlength="1000"></textarea></div>${modalButtons('发送回应')}`, async data => {
-        await change(`/contributions/${cid}/reply`, {
-          reason: data.get('reason')
-        });
-        modal.close();
-      });
+      replyDialog(button.dataset.reply);
+      return;
+    }
+    if (button.dataset.opinionFeedback) {
+      opinionFeedbackDialog(button.dataset.opinionFeedback, button.dataset.feedbackAction);
+      return;
+    }
+    if (button.dataset.intervention) {
+      await change('/interventions/feedback', {request: button.dataset.intervention, rating: button.dataset.rating});
+      toast('评价已记录，仅你可见；不会改变你的回应资格');
       return;
     }
     if (button.dataset.requestId) {
-      await change(`/requests/${button.dataset.requestId}`, {
-        action: button.dataset.requestAction
-      }, 'PATCH');
-      toast('请求状态已同步');
+      const qid = button.dataset.requestId, action = button.dataset.requestAction;
+      if (action === 'handled') {
+        showDialog('记录已安排的回应', `<p class="list-note">请说明实际安排的发言机会或澄清内容。已提交意见需要逐条答复。</p><label class="form-label" for="request-reason">具体回应说明</label><textarea id="request-reason" name="reason" required maxlength="1000"></textarea>${modalButtons('记录回应')}`, async data => {
+          await change(`/requests/${qid}`, {action, reason:data.get('reason')}, 'PATCH');
+          modal.close();
+        });
+      } else {
+        await change(`/requests/${qid}`, {action}, 'PATCH');
+        toast('回应进度已同步');
+      }
       return;
     }
     if (button.dataset.copy) {
@@ -915,6 +997,7 @@ document.addEventListener('click', async event => {
       render();
     }
     if (action === 'end-review') {
+      if (state.review) state.reviewed.set(`${state.review.segment}:${state.review.rev}`, state.review);
       state.review = null;
       await reportProgress();
       render();
@@ -927,7 +1010,8 @@ document.addEventListener('click', async event => {
     }
     if (action === 'speech-replay') await speech.replay();
     if (action === 'record') {
-      if (state.recording) stopRecording();
+      if (state.recordingStarting || state.recordingStopping) return;
+      if (state.recording) await stopRecording();
       else await startRecording();
     }
     if (action === 'auto-analyze') {
@@ -1085,6 +1169,7 @@ async function init() {
   home();
 }
 window.addEventListener('beforeunload', () => {
+  microphone?.abort();
   camera?.stop();
   window.speechSynthesis?.cancel();
 });

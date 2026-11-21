@@ -70,7 +70,12 @@ def test_four_roles_and_actual_lifecycle(env):
     assert result["status"] == "confirmed"
     mine = call(client, members[0], '/snapshot', method="GET")
     assert mine["contributions"][0]["id"] == opinion["id"]
-    assert mine["contributions"][0]["resolution"]["after"] == "改到周日"
+    assert mine["contributions"][0]["status"] == "pending"
+    assert mine["contributions"][0]["resolution"] is None, "决定结项不能代替逐条答复"
+    call(client, host, f'/contributions/{opinion["id"]}/reply', {"version": 1, "outcome": "adopted",
+         "reason": "采纳设备时间建议", "impact": "活动改为周日"})
+    mine = call(client, members[0], '/snapshot', method="GET")
+    assert mine["contributions"][0]["resolution"]["impact"] == "活动改为周日"
 
 
 @pytest.mark.parametrize("case", ["unrelated", "revoked", "stale", "no_consent", "paused"])
@@ -181,8 +186,8 @@ def test_independent_contribution_can_be_answered_without_decision(env):
     client, _ = env
     host, members, _, _ = setup_room(env)
     contribution = call(client, members[0], '/contributions', {"text": "请解释一下今天的活动范围"})
-    call(client, members[1], f'/contributions/{contribution["id"]}/reply', {"reason": "冒充主持人"}, status=403)
-    call(client, host, f'/contributions/{contribution["id"]}/reply', {"reason": "本次只讨论校内活动安排"})
+    call(client, members[1], f'/contributions/{contribution["id"]}/reply', {"version": 1, "reason": "冒充主持人"}, status=403)
+    call(client, host, f'/contributions/{contribution["id"]}/reply', {"version": 1, "reason": "本次只讨论校内活动安排"})
     mine = call(client, members[0], '/snapshot', method="GET")
     assert mine["contributions"][0]["status"] == "handled"
     assert mine["contributions"][0]["resolution"]["reason"] == "本次只讨论校内活动安排"

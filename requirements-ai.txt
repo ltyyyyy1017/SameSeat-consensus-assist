@@ -1,6 +1,6 @@
-# 仅在接入本地录音转写时安装；模型需另行下载并指定目录。
-faster-whisper==1.2.1
-# PyAV 19 移除了 faster-whisper 1.2.1 使用的 metadata_errors 参数。
+# 复用现成中文字幕组件：SenseVoice + Silero VAD；模型用 setup_asr.py 下载。
+sherpa-onnx==1.13.8
+# 文件上传接口的音频解码；连续收音通过原始 PCM 传输。
 av==16.1.0
 onnxruntime==1.32.0
 tokenizers==0.23.3

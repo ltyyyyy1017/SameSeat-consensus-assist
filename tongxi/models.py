@@ -72,6 +72,8 @@ class Presentation(Input):
     evidence: list[Evidence] = Field(max_length=150)
     state: Literal["queued", "playing", "finished", "cancelled", "paused", "error", "review", "idle"]
     instance: str = Field(min_length=1, max_length=100)
+    completed: list[Evidence] = Field(default_factory=list, max_length=150)
+    review_completed: list[Evidence] = Field(default_factory=list, max_length=150)
 
 
 class ManualRequest(Input):
@@ -81,7 +83,8 @@ class ManualRequest(Input):
 
 
 class RequestAction(Input):
-    action: Literal["seen", "handled", "withdraw", "skip"]
+    action: Literal["seen", "handled", "withdraw", "skip", "ready", "extend", "express"]
+    reason: str = Field(default="", max_length=1000)
 
 
 class NoticeAction(Input):
@@ -111,3 +114,17 @@ class Export(Input):
 
 class Reply(Input):
     reason: str = Field(min_length=1, max_length=1000)
+    version: int = Field(ge=1)
+    outcome: Literal["adopted", "partial", "not_adopted", "verifying", "answered"] = "answered"
+    impact: str = Field(default="", max_length=1000)
+
+
+class ContributionFeedback(Input):
+    version: int = Field(ge=1)
+    action: Literal["acknowledge", "dispute"]
+    reason: str = Field(default="", max_length=1000)
+
+
+class InterventionFeedback(Input):
+    request: str
+    rating: Literal["helpful", "unnecessary", "uncomfortable"]

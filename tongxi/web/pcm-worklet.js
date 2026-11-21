@@ -3,6 +3,16 @@ class PcmCapture extends AudioWorkletProcessor {
     super();
     this.buffer = new Float32Array(2048);
     this.offset = 0;
+    this.port.onmessage = event => {
+      if (event.data?.type === 'flush') {
+        if (this.offset) {
+          const tail = this.buffer.slice(0, this.offset);
+          this.port.postMessage(tail, [tail.buffer]);
+          this.offset = 0;
+        }
+        this.port.postMessage({type: 'flushed'});
+      }
+    };
   }
   process(inputs) {
     const channels = inputs[0];

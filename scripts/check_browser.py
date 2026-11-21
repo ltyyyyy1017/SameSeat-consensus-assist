@@ -75,7 +75,13 @@ def main():
         subtitle.get_by_text('周六实验室设备借不到，我建议改成周日。', exact=True).wait_for()
         host.get_by_role('button', name='回应工作台', exact=False).click()
         host.get_by_text('周六实验室设备借不到，我建议改成周日。', exact=True).wait_for()
-        host.get_by_role('button', name='处理关联议题').click()
+        host.get_by_role('button', name='逐条答复', exact=True).click()
+        host.get_by_label('这条意见如何处理').select_option('adopted')
+        host.get_by_label('针对这条意见的答复').fill('采纳设备时间建议，改到周日。')
+        host.get_by_label('具体影响或采纳范围', exact=False).fill('活动日期改为周日。')
+        host.get_by_role('button', name='发送这条答复', exact=True).click()
+        host.get_by_role('button', name='议题与决定', exact=True).click()
+        host.get_by_role('button', name='核对并确认决定', exact=True).click()
         host.get_by_label('如何处理').select_option('modify')
         host.get_by_label('修改后的结论', exact=False).fill('周日采用方案 B 开展活动')
         host.get_by_label('处理理由／回应说明').fill('采纳设备时间建议，改到周日。')
@@ -92,9 +98,11 @@ def main():
             host.locator('main h1').wait_for()
         host.get_by_role('button', name='实时讨论', exact=True).click()
         host.get_by_role('heading', name='本地 AI 候选议题', exact=True).wait_for()
+        if host.get_by_role('button', name='开启自动提议', exact=True).count():
+            host.get_by_role('button', name='开启自动提议', exact=True).click()
         host.locator('[data-candidate]').first.wait_for(timeout=90000)
         host.screenshot(path=str(OUT / '实时讨论与AI候选.png'), full_page=True)
-        # 合成麦克风只验证浏览器录音容器到本地转写接口，无需真实用户录音。
+        # 合成麦克风验证连续 PCM → 官方 VAD/ASR → 房间字幕，不访问真实麦克风。
         host.get_by_role('button', name='开启本地转写', exact=True).click()
         host.get_by_role('button', name='停止录音', exact=True).wait_for()
         host.get_by_role('button', name='停止录音', exact=True).click()
@@ -107,6 +115,7 @@ def main():
         host.get_by_role('button', name='关闭摄像头', exact=True).click()
         host.get_by_text('摄像头已关闭，短时动作缓存已清除。', exact=True).wait_for()
         fourth.get_by_role('button', name='实时讨论', exact=True).click()
+        fourth.locator('.audio-drawer > summary').click()
         fourth.get_by_role('button', name='开启播报', exact=True).click()
         fourth.get_by_text('播放中', exact=True).wait_for(timeout=30000)
         fourth.get_by_role('button', name='关闭播报', exact=True).click()
@@ -118,7 +127,7 @@ def main():
         assert not errors, errors
         assert not external_requests, external_requests
         result = {"four_client_lifecycle": "passed", "mobile_overflow": "passed", "local_tts_playback": "passed",
-                  "local_ai_candidate": "passed", "synthetic_microphone_upload": "passed", "external_page_requests": external_requests,
+                  "local_ai_candidate": "passed", "synthetic_microphone_continuous_captions": "passed", "external_page_requests": external_requests,
                   "local_vision_initialization_synthetic_camera": "passed", "page_errors": errors,
                   "screenshots": [x.name for x in OUT.glob('*.png')]}
         (OUT / 'browser-check.json').write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
