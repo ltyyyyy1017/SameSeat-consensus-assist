@@ -95,3 +95,22 @@ def test_explicit_conditional_quote_cannot_be_final_candidate():
     segments = [{'id': 's1', 'rev': 1, 'text': '如果采用方案B，需要先预约。'}]
     result = adapters.extract_candidates(segments, [{'title': '方案B', 'decision_segment': 's1', 'premises': []}])
     assert result == []
+
+
+def test_model_citations_round_trip_to_stable_room_segments(monkeypatch):
+    segments = [
+        {"id": "s2", "rev": 4, "text": "方案B需要实验室。", "stable": True},
+        {"id": "pending", "rev": 1, "text": "这句还没稳定。", "stable": False},
+        {"id": "s1", "rev": 2, "text": "那就采用方案B。", "stable": True},
+    ]
+
+    def generate(local, prompt, schema):
+        fields = schema["properties"]["items"]["items"]["properties"]
+        assert fields["decision_segment"]["enum"] == ["s1", "s2"]
+        assert "这句还没稳定" not in prompt
+        return {"items": [{"title": "方案B", "decision_segment": "s2", "premises": ["s1"]}]}
+
+    monkeypatch.setattr(adapters, "generate_json", generate)
+    result = adapters.analyze_discussion({"segments": segments}, None)
+    assert result["items"][0]["conclusion"] == "那就采用方案B。"
+    assert result["items"][0]["evidence"] == [{"segment": "s2", "rev": 4}, {"segment": "s1", "rev": 2}]

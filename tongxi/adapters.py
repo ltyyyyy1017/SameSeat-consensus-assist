@@ -173,7 +173,10 @@ def generate_json(local, prompt, schema):
 
 
 def analyze_discussion(room, local):
-    segments = [{k: s[k] for k in ("id", "rev", "text")} for s in room["segments"][-30:] if s["stable"]]
+    stable = [s for s in room["segments"][-30:] if s["stable"]]
+    # The model cites positions within this input. Only room IDs leave this function.
+    sources = {f"s{n}": s for n, s in enumerate(stable, 1)}
+    segments = [{"id": ref, "rev": s["rev"], "text": s["text"]} for ref, s in sources.items()]
     require(bool(segments), "请先记录一些稳定字幕")
     schema = {"type": "object", "additionalProperties": False, "required": ["phase", "summary", "items"], "properties": {
         "phase": {"type": "string", "enum": ["discussing", "seeking_response", "closing", "uncertain"]},
@@ -194,6 +197,9 @@ def analyze_discussion(room, local):
               + json.dumps(segments, ensure_ascii=False))
     result = generate_json(local, prompt, schema)
     result["items"] = extract_candidates(segments, result.get("items", []))
+    for item in result["items"]:
+        for evidence in item["evidence"]:
+            evidence["segment"] = sources[evidence["segment"]]["id"]
     return result
 
 
