@@ -73,3 +73,64 @@ export class PhraseMicrophone {
     this.frames = []; this.preRoll = [];
   }
 }
+
+function toPcm16(samples, fromRate) {
+  const outLen = Math.max(1, Math.floor(samples.length * 16000 / fromRate));
+  const pcm = new Int16Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * fromRate / 16000;
+    const left = Math.floor(pos);
+    const right = Math.min(left + 1, samples.length - 1);
+    const mixed = samples[left] * (1 - (pos - left)) + samples[right] * (pos - left);
+    const value = Math.max(-1, Math.min(1, mixed));
+    pcm[i] = value < 0 ? value * 0x8000 : value * 0x7fff;
+  }
+  return pcm;
+}
+
+export class StreamMicrophone {
+  constructor(session, onStatus) {
+    this.session = session;
+    this.onStatus = onStatus;
+    this.stream = null;
+    this.socket = null;
+  }
+  async start() {
+    this.stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, channelCount: 1}});
+    this.context = new AudioContext();
+    await this.context.audioWorklet.addModule('/assets/pcm-worklet.js');
+    this.node = new AudioWorkletNode(this.context, 'tongxi-pcm');
+    this.source = this.context.createMediaStreamSource(this.stream);
+    const mute = this.context.createGain();
+    mute.gain.value = 0;
+    this.source.connect(this.node).connect(mute).connect(this.context.destination);
+    this.socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/v1/rooms/${this.session.room}/asr`);
+    await new Promise((resolve, reject) => {
+      this.socket.onopen = resolve;
+      this.socket.onerror = () => reject(new Error('无法连接 FunASR 转写通道'));
+    });
+    this.socket.send(JSON.stringify({token: this.session.token}));
+    this.socket.onmessage = event => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'error') this.onStatus(message.message);
+      } catch { /* 二进制回执不用于字幕，字幕由房间快照更新。 */ }
+    };
+    this.node.port.onmessage = event => {
+      if (this.socket?.readyState !== WebSocket.OPEN) return;
+      this.socket.send(toPcm16(event.data, this.context.sampleRate).buffer);
+    };
+    await this.context.resume();
+    this.onStatus('正在连续转写。临时字幕会在句末修正，修正后的稳定字幕才进入议题分析。');
+  }
+  stop() {
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({type: 'stop'}));
+    this.socket?.close();
+    this.socket = null;
+    this.stream?.getTracks().forEach(track => track.stop());
+    this.stream = null;
+    if (this.node) {this.node.port.onmessage = null; this.node.disconnect();}
+    this.source?.disconnect();
+    this.context?.close().catch(() => {});
+  }
+}

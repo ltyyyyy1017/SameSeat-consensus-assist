@@ -34,8 +34,24 @@ def native_model_path():
     preferred = RUNTIME / "qwen-1.5b.gguf"
     return preferred if preferred.is_file() else RUNTIME / "qwen.gguf"
 
+def funasr_target():
+    host = os.getenv("TONGXI_FUNASR_HOST", "127.0.0.1")
+    port = int(os.getenv("TONGXI_FUNASR_PORT", "10095"))
+    secure = os.getenv("TONGXI_FUNASR_SSL", "1") != "0"
+    return f"{'wss' if secure else 'ws'}://{host}:{port}", secure, host, port
+
+
+def funasr_ready():
+    _, _, host, port = funasr_target()
+    try:
+        with socket.create_connection((host, port), 0.4):
+            return True
+    except OSError:
+        return False
+
+
 def capabilities():
-    return {"asr": {"ready": Path(asr_model_path(), "model.bin").is_file(), "label": "本地 faster-whisper"},
+    return {"asr": {"ready": funasr_ready(), "label": "FunASR Runtime 2-pass"},
             "semantic": {"ready": bool(os.getenv("TONGXI_MODEL")) or native_model_ready(), "label": "本地 Ollama" if os.getenv("TONGXI_MODEL") else "本地 Qwen 1.5B" if native_model_path().name == "qwen-1.5b.gguf" else "本地 Qwen 0.5B"},
             "tts": {"ready": platform.system() == "Windows", "label": "Windows 本机中文语音"},
             "matching": "本地语义关联，失败时使用词组检索", "storage": "内存 SQLite；重启清空"}

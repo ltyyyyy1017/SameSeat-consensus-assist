@@ -24,6 +24,8 @@ const labels = {
   handled: '已处理',
   withdrawn: '已撤回',
   skipped: '已略过',
+  expired: '已失效',
+  ignored: '已忽略',
   invalidated: '依据已修订',
   pending: '等待处理'
 };
@@ -57,11 +59,11 @@ const state = {
   analysisBusy: false,
   analysisError: '',
   visionHint: null,
+  vision: null,
+  expressionKey: '',
   pendingConsent: null
 };
 let socket, reconnectTimer, toastTimer, microphone, camera;
-const audioQueue = [];
-let audioDraining = false;
 const modal = $('#modal');
 
 function toast(text) {
@@ -195,7 +197,8 @@ function connect() {
     if (message.type === 'snapshot') {
       const before = state.snapshot;
       state.snapshot = message.data;
-      if (before && state.snapshot.requests?.some(q => q.member === state.snapshot.me.id && q.source === 'auto' && !before.requests?.some(b => b.id === q.id))) toast('已为你保留一次回应机会，可以读完后再说');
+      const opened = q => q.member === state.snapshot.me.id && (q.source === 'auto' || q.source === 'vision') && ['delivered', 'seen', 'confirmed'].includes(q.status);
+      if (before && state.snapshot.requests?.some(q => opened(q) && !before.requests?.some(b => b.id === q.id && opened(b)))) toast('已为当前议题保留一次回应机会，可以继续表达、略过或撤回');
       remember();
       applyServerAnalysis();
       render();
@@ -231,7 +234,7 @@ function home() {
   $('#app').innerHTML = `<main id="main" class="home">
     <nav class="home-nav">${brand()}<div class="home-nav-actions"><span class="local-label">为每一种参与方式留出空间</span><button data-action="join">加入讨论</button></div></nav>
     <section class="hero">
-      <div class="hero-copy"><div class="hero-kicker">校园讨论协作工具</div><h1>让讨论跟上<br>每个人的节奏。</h1><p>实时查看讨论原句，围绕具体议题补充意见，在决定确认前留出回应的时间。</p><div class="hero-actions"><button class="primary" data-action="create">创建讨论房间</button><button class="home-demo" data-action="demo">体验示例讨论</button></div><div class="home-privacy">本地运行 / 参与方式可自行选择</div></div>
+      <div class="hero-copy"><div class="hero-kicker">面向听障人士与多元沟通需求的会议参与辅助</div><h1>让不容易被察觉的<br>表达意愿被看见。</h1><p>在高校线上小组讨论中，把非语言行为转化为表达信号。先不点名提醒主持人，由主持人决定是否为当前议题保留回应机会。</p><div class="hero-actions"><button class="primary" data-action="create">创建讨论房间</button><button class="home-demo" data-action="demo">体验示例讨论</button></div><div class="home-privacy">本地运行 / 参与方式可自行选择</div></div>
       <div class="stage" aria-label="功能示意，非实时数据">
         <div class="preview-window"><div class="preview-top"><div class="window-dots"><i></i><i></i><i></i></div><span>小组讨论 / 界面示意</span><span class="preview-live">讨论中</span></div><div class="preview-main"><div class="preview-conversation"><div class="preview-heading"><span>实时字幕</span><span>字幕已开启</span></div><div class="preview-line"><div><small>讨论原句</small><p>方案 B 需要实验室设备，<br>周六可以使用实验室。</p></div></div><div class="preview-line second"><div><small>讨论原句</small><p>那就先选 B，<br>接下来讨论人员分工。</p></div></div><div class="preview-caption">正在为这项讨论保留回应机会<span class="caption-dots">•••</span></div></div><aside class="preview-aside"><div class="preview-heading"><span>当前议题</span><span>···</span></div><div class="preview-topic"><span class="preview-wait">● &nbsp;待回应</span><h3>校园活动<br>方案 B</h3><p>在确认之前，<br>等待相关回应。</p><div class="preview-topic-foot">依据原句已关联</div></div><div class="preview-note"><strong>回应机会</strong><p>可以继续讨论其他事项</p></div></aside></div><div class="preview-toolbar"><span>字幕</span><span>议题</span><span class="preview-tool-active">回应</span><span>参与方式</span></div></div>
       </div>
@@ -254,7 +257,7 @@ function createDialog(demo = false) {
 }
 
 function joinDialog(invite = '') {
-  showDialog('加入讨论', `<div class="field"><label class="form-label" for="invite">邀请链接或邀请码</label><input name="invite" id="invite" value="${esc(invite)}" required placeholder="粘贴主持人发来的邀请"></div><div class="field"><label class="form-label" for="join-name">怎么称呼你</label><input name="name" id="join-name" required maxlength="30" placeholder="你的名字或昵称"></div><div class="hint">加入后可选择字幕、播报与自动留位。个人进度只在本场用于相应的留位规则。</div>${modalButtons('加入讨论')}`, async data => {
+  showDialog('加入讨论', `<div class="field"><label class="form-label" for="invite">邀请链接或邀请码</label><input name="invite" id="invite" value="${esc(invite)}" required placeholder="粘贴主持人发来的邀请"></div><div class="field"><label class="form-label" for="join-name">怎么称呼你</label><input name="name" id="join-name" required maxlength="30" placeholder="你的名字或昵称"></div><div class="hint">加入后可选择字幕和播报。播报滞后、主动回看可以按授权自动留位。持续表达信号需要单独授权，只会私下提醒主持人，不会自动暂停会议。</div>${modalButtons('加入讨论')}`, async data => {
     let code = data.get('invite');
     try {
       code = new URLSearchParams(new URL(code).hash.slice(1)).get('invite') || code;
@@ -270,7 +273,8 @@ function joinDialog(invite = '') {
 
 function nav() {
   const s = state.snapshot;
-  const pending = s.requests?.filter(q => ['delivered', 'seen'].includes(q.status)).length || 0;
+  const openRequest = s.role === 'host' ? ['delivered', 'seen'] : ['delivered', 'seen', 'confirmed'];
+  const pending = s.requests?.filter(q => openRequest.includes(q.status)).length || 0;
   return [
     ['overview', 'home', '讨论概览'],
     ['live', 'talk', '实时讨论'],
@@ -350,29 +354,95 @@ function head(title, sub, tools = '') {
 
 function metrics() {
   const s = state.snapshot;
-  return `<div class="stats">${[['本场议题',s.decisions.length,'项'],['待回应议题',s.decisions.filter(d=>d.status==='waiting').length,'项'],['已确认决定',s.decisions.filter(d=>d.status==='confirmed').length,'项'],[s.role==='host'?'已加入成员':'我的待处理请求',s.role==='host'?s.members.length:s.requests.filter(q=>['delivered','seen'].includes(q.status)).length,s.role==='host'?'人':'条']].map(([label,n,unit])=>`<article class="stat"><span>${label}</span><strong>${n}<small>${unit}</small></strong></article>`).join('')}</div>`;
+  return `<div class="stats">${[['本场议题',s.decisions.length,'项'],['待回应议题',s.decisions.filter(d=>d.status==='waiting').length,'项'],['已确认决定',s.decisions.filter(d=>d.status==='confirmed').length,'项'],[s.role==='host'?'已加入成员':'我的待处理请求',s.role==='host'?s.members.length:s.requests.filter(q=>['delivered','seen','confirmed'].includes(q.status)).length,s.role==='host'?'人':'条']].map(([label,n,unit])=>`<article class="stat"><span>${label}</span><strong>${n}<small>${unit}</small></strong></article>`).join('')}</div>`;
 }
 
 function overview() {
   const s = state.snapshot;
-  return head('讨论概览', '查看当前议题、回应和参与状态。', s.role === 'host' ? '<button class="primary" data-action="new-decision">建立议题</button>' : '<button class="primary" data-view="live">进入实时讨论</button>') + metrics() + (s.role === 'host' ? suggestionPanel() : '') + `<div class="columns"><div>${s.demo?'<div class="hint amber" style="margin-bottom:20px">当前为示例讨论，字幕为人工编写。你仍可以真实邀请成员、回看原句并验证留位流程。</div>':''}${panel('正在讨论的议题',s.decisions.length?s.decisions.map(d=>decisionCard(d)).join(''):empty('还没有议题','先记录几句讨论内容，再选择原句建立议题。'))}${panel('最近的讨论原句',s.segments.length?`<div>${s.segments.slice(-3).map(seg=>`<div class="segment"><div class="seg-body"><div class="segment-meta">${seg.source==='asr'?'录音转写':'主持人记录'} · 第 ${s.segments.indexOf(seg)+1} 句 · v${seg.rev}</div><p>${esc(seg.text)}</p></div></div>`).join('')}</div>`:empty('从一句话开始','可以现场录音转写，或由主持人先输入原话。'),'<button class="ghost small" data-view="live">查看全部</button>')}</div><aside>${panel('本场参与方式',`<div class="panel-body"><div class="status-row"><span>字幕呈现</span><span class="tag">已开启</span></div><div class="status-row"><span>播报滞后自动留位</span><span class="tag ${s.me.consent.playback?'':'neutral'}">${s.me.consent.playback?'已授权':'未开启'}</span></div><div class="status-row"><span>主动回看时留位</span><span class="tag ${s.me.consent.review?'':'neutral'}">${s.me.consent.review?'已授权':'未开启'}</span></div><button class="wide" style="margin-top:17px" data-action="consent">管理我的授权</button></div>`)}${panel('一次回应如何被处理',`<div class="panel-body">${[['确认依据','主持人核对与决定相关的原句。'],['留住机会','按个人授权，议题进入待回应。'],['共同处理','提交补充，主持人说明最终结果。']].map(([t,p],i)=>`<div class="mini-step"><span class="step-dot">${i+1}</span><div><b>${t}</b><p>${p}</p></div></div>`).join('')}</div>`)}</aside></div>`;
+  return head('讨论概览', '查看当前议题、回应和参与状态。', s.role === 'host' ? '<button class="primary" data-action="new-decision">建立议题</button>' : '<button class="primary" data-view="live">进入实时讨论</button>') + metrics() + (s.role === 'host' ? suggestionPanel() : '') + `<div class="columns"><div>${s.demo?'<div class="hint amber" style="margin-bottom:20px">当前为示例讨论，字幕为人工编写。你仍可以真实邀请成员、回看原句并验证留位流程。</div>':''}${panel('正在讨论的议题',s.decisions.length?s.decisions.map(d=>decisionCard(d)).join(''):empty('还没有议题','先记录几句讨论内容，再选择原句建立议题。'))}${panel('最近的讨论原句',s.segments.length?`<div>${s.segments.slice(-3).map(seg=>`<div class="segment"><div class="seg-body"><div class="segment-meta">${seg.source==='asr'?'录音转写':'主持人记录'} · 第 ${s.segments.indexOf(seg)+1} 句 · v${seg.rev}</div><p>${esc(seg.text)}</p></div></div>`).join('')}</div>`:empty('从一句话开始','可以现场录音转写，或由主持人先输入原话。'),'<button class="ghost small" data-view="live">查看全部</button>')}</div><aside>${expressionPanel()}${panel('本场参与方式',`<div class="panel-body"><div class="status-row"><span>字幕呈现</span><span class="tag">已开启</span></div><div class="status-row"><span>播报滞后自动留位</span><span class="tag ${s.me.consent.playback?'':'neutral'}">${s.me.consent.playback?'已授权':'未开启'}</span></div><div class="status-row"><span>主动回看时留位</span><span class="tag ${s.me.consent.review?'':'neutral'}">${s.me.consent.review?'已授权':'未开启'}</span></div><div class="status-row"><span>摄像头分析</span><span class="tag ${s.me.consent.camera?'':'neutral'}">${s.me.consent.camera?'已授权':'未开启'}</span></div><div class="status-row"><span>表达信号私下提醒</span><span class="tag ${s.me.consent.intervene?'':'neutral'}">${s.me.consent.intervene?'已授权':'未开启'}</span></div><button class="wide" style="margin-top:17px" data-action="consent">管理我的授权</button></div>`)}${panel('一次回应如何被处理',`<div class="panel-body">${[['确认依据','主持人核对与决定相关的原句。'],['留住机会','主持人确认或本人请求后，议题进入待回应。'],['共同处理','提交补充，主持人说明最终结果。']].map(([t,p],i)=>`<div class="mini-step"><span class="step-dot">${i+1}</span><div><b>${t}</b><p>${p}</p></div></div>`).join('')}</div>`)}</aside></div>`;
 }
 
 function decisionCard(d) {
   const s = state.snapshot;
-  return `<article class="decision"><div class="row between">${tag(d.status)}<span class="muted small-text">第 ${d.round} 轮 · v${d.version}</span></div><h3>${esc(d.title)}</h3><p>${esc(d.conclusion)}</p>${d.evidence.map(e=>`<div class="quote">${esc(segmentById(e.segment)?.text||'原句不可用')} <span class="muted small-text">v${e.rev}</span></div>`).join('')}${d.resolutions.length?`<div class="resolution-label">${esc(actions[d.resolutions.at(-1).action])} · ${esc(d.resolutions.at(-1).reason)}</div>`:''}<div class="actions">${s.role==='host'&&['discussing','deferred','review'].includes(d.status)?`<button class="primary small" data-prepare="${d.id}">${d.status==='review'?'核对新版依据':'准备定案'}</button>`:''}${s.role==='host'&&['preparing','waiting'].includes(d.status)?`<button class="primary small" data-resolve="${d.id}" data-resolve-action="maintain">处理并确认</button><button class="small" data-resolve="${d.id}" data-resolve-action="defer">推迟</button>`:''}${s.role==='host'&&d.status==='confirmed'?`<button class="small" data-resolve="${d.id}" data-resolve-action="reopen">重新讨论</button>`:''}<button class="ghost small" data-compose="${d.id}">补充这个议题</button></div></article>`;
+  return `<article class="decision"><div class="row between">${tag(d.status)}${s.active_decision===d.id?'<span class="tag">当前议题</span>':''}<span class="muted small-text">第 ${d.round} 轮 · v${d.version}</span></div><h3>${esc(d.title)}</h3><p>${esc(d.conclusion)}</p>${d.evidence.map(e=>`<div class="quote">${esc(segmentById(e.segment)?.text||'原句不可用')} <span class="muted small-text">v${e.rev}</span></div>`).join('')}${d.resolutions.length?`<div class="resolution-label">${esc(actions[d.resolutions.at(-1).action])} · ${esc(d.resolutions.at(-1).reason)}</div>`:''}<div class="actions">${s.role==='host'&&['discussing','deferred','review'].includes(d.status)?`<button class="primary small" data-prepare="${d.id}">${d.status==='review'?'核对新版依据':'准备定案'}</button>`:''}${s.role==='host'&&['preparing','waiting'].includes(d.status)&&s.active_decision!==d.id?`<button class="small" data-focus="${d.id}">设为当前议题</button>`:''}${s.role==='host'&&['preparing','waiting'].includes(d.status)?`<button class="primary small" data-resolve="${d.id}" data-resolve-action="maintain">处理并确认</button><button class="small" data-resolve="${d.id}" data-resolve-action="defer">推迟</button>`:''}${s.role==='host'&&d.status==='confirmed'?`<button class="small" data-resolve="${d.id}" data-resolve-action="reopen">重新讨论</button>`:''}<button class="ghost small" data-compose="${d.id}">补充这个议题</button></div></article>`;
 }
 
 function live() {
   const s = state.snapshot,
     host = s.role === 'host';
-  return head('实时讨论', '保持原句可见，让补充能够回到它回应的地方。', host ? `<button class="${state.recording?'recording':''}" data-action="record">${state.recording?'停止录音':'开启本地转写'}</button>` : '') + `<div class="columns"><div>${state.review?`<div class="hint review-banner">正在回看选中的原句<button class="small" data-action="end-review">回到实时位置</button></div>`:''}${panel('讨论原句',`<div class="transcript" id="transcript">${s.segments.length?s.segments.map((seg,i)=>`<article class="segment ${state.review?.segment===seg.id?'selected':''}">${host?`<input type="checkbox" data-evidence="${seg.id}" aria-label="选择第 ${i+1} 句作为决定依据" ${state.selected.has(seg.id)?'checked':''}>`:''}<div class="seg-body"><div class="segment-meta"><span>第 ${i+1} 句</span><span>${seg.source==='asr'?'本地转写':'主持人记录'}</span><span>v${seg.rev}${seg.rev>1?' · 已修订':''}</span>${!seg.stable?'<span>临时字幕</span>':''}</div><p>${esc(seg.text)}</p><div class="seg-tools"><button class="ghost small" data-review="${seg.id}">回看这句</button><button class="ghost small" data-quote="${seg.id}">回应这句</button>${host?`<button class="ghost small" data-edit="${seg.id}">修订</button>`:''}</div></div></article>`).join(''):empty('等待讨论开始','原句会按顺序出现在这里。')}</div>${host?'<div class="panel-body"><form id="segment-form"><label class="form-label" for="segment-input">记录一句讨论原话</label><textarea id="segment-input" name="text" required placeholder="例如：方案 B 需要实验室设备，周六可以使用实验室。" maxlength="1500"></textarea><div class="row between" style="margin-top:12px"><span class="muted small-text">将明确标记为主持人记录</span><button class="primary" type="submit">加入字幕</button></div></form></div>':''}`,`<span class="muted">${s.segments.length} 句</span>`)}${host?`<div class="row"><button data-action="new-decision" class="primary">用选中原句建立议题</button><button data-action="analyze">本地 AI 提议议题</button></div>${suggestionPanel()}`:''}</div><aside>${visionHintPanel()}${playerPanel()}${panel('回应与阅读',`<div class="panel-body"><div class="hint">${s.me.consent.review?'已授权回看留位。你主动选择回看相关依据、主持人准备定案时，系统会替该议题留位。':'点击“回看这句”保留阅读位置。你可以在个人授权里开启相关依据回看时自动留位。'}</div><button class="wide" style="margin-top:15px" data-action="compose">写一条补充意见</button></div>`)}${panel('当前议题',s.decisions.some(d=>d.status!=='confirmed')?s.decisions.filter(d=>d.status!=='confirmed').slice(-2).map(d=>decisionCard(d)).join(''):empty('暂无进行中的议题','主持人可以从原句建立。'))}</aside></div>`;
+  return head('实时讨论', '保持原句可见，让补充能够回到它回应的地方。', host ? `<button class="${state.recording?'recording':''}" data-action="record">${state.recording?'停止录音':'开启本地转写'}</button>` : '') + `<div class="columns"><div>${state.review?`<div class="hint review-banner">正在回看选中的原句<button class="small" data-action="end-review">回到实时位置</button></div>`:''}${panel('讨论原句',`<div class="transcript" id="transcript">${s.segments.length?s.segments.map((seg,i)=>`<article class="segment ${state.review?.segment===seg.id?'selected':''}">${host?`<input type="checkbox" data-evidence="${seg.id}" aria-label="选择第 ${i+1} 句作为决定依据" ${state.selected.has(seg.id)?'checked':''}>`:''}<div class="seg-body"><div class="segment-meta"><span>第 ${i+1} 句</span><span>${seg.source==='asr'?'本地转写':'主持人记录'}</span><span>v${seg.rev}${seg.rev>1?' · 已修订':''}</span>${!seg.stable?'<span>临时字幕</span>':''}</div><p>${esc(seg.text)}</p><div class="seg-tools"><button class="ghost small" data-review="${seg.id}">回看这句</button><button class="ghost small" data-quote="${seg.id}">回应这句</button>${host?`<button class="ghost small" data-edit="${seg.id}">修订</button>`:''}</div></div></article>`).join(''):empty('等待讨论开始','原句会按顺序出现在这里。')}</div>${host?'<div class="panel-body"><form id="segment-form"><label class="form-label" for="segment-input">记录一句讨论原话</label><textarea id="segment-input" name="text" required placeholder="例如：方案 B 需要实验室设备，周六可以使用实验室。" maxlength="1500"></textarea><div class="row between" style="margin-top:12px"><span class="muted small-text">将明确标记为主持人记录</span><button class="primary" type="submit">加入字幕</button></div></form></div>':''}`,`<span class="muted">${s.segments.length} 句</span>`)}${host?`<div class="row"><button data-action="new-decision" class="primary">用选中原句建立议题</button><button data-action="analyze">本地 AI 提议议题</button></div>${suggestionPanel()}`:''}</div><aside>${expressionPanel()}${visionHintPanel()}${playerPanel()}${panel('回应与阅读',`<div class="panel-body"><div class="hint">${s.me.consent.review?'已授权回看留位。你主动选择回看相关依据、主持人准备定案时，系统会替该议题留位。':'点击“回看这句”保留阅读位置。你可以在个人授权里开启相关依据回看时自动留位。'}</div><button class="wide" style="margin-top:15px" data-action="compose">写一条补充意见</button></div>`)}${panel('当前议题',decisionById(s.active_decision)?decisionCard(decisionById(s.active_decision)):empty('还没有当前议题','主持人准备定案，或从仍未结项的议题里重新选择。'))}</aside></div>`;
 }
 
+function signalText(view) {
+  if (!view) return '尚未判断';
+  const current = state.snapshot?.decisions?.find(d => d.id === state.snapshot.active_decision);
+  const open = Boolean(current && (current.status === 'preparing' || current.status === 'waiting'));
+  if (view.kind === 'speak' && view.confident) return open ? '可能希望补充' : '可能准备发言';
+  if (view.kind === 'wait' && view.confident) return '可能需要等待';
+  if (view.kind === 'listen') return '接近自然聆听';
+  return '状态不确定';
+}
+function meter(name, value) {
+  return `<div class="meter"><span>${name}</span><i><b style="width:${Math.round((value || 0) * 100)}%"></b></i></div>`;
+}
+function signalBody(view) {
+  if (!view) return '<p class="list-note">开启摄像头并校准自然坐姿后，这里显示只留在本机的表达信号。</p>';
+  const bars = view.bars || {};
+  return `<strong data-signal-label>${esc(signalText(view))}</strong><div class="signal-meters">${meter('嘴部', bars.mouth)}${meter('前倾', bars.lean)}${meter('俯仰', bars.pitch)}${meter('转向', bars.turn)}</div><p class="list-note">${esc(view.summary || '')}</p>`;
+}
+function paintSignal(view) {
+  const box = document.getElementById('signal-readout');
+  if (box) box.innerHTML = signalBody(view);
+}
+function hostNoticePanel() {
+  const s = state.snapshot;
+  if (!s || s.role !== 'host') return '';
+  const notices = (s.notices || []).filter(n => n.status === 'pending');
+  if (!notices.length) return '';
+  return notices.map(n => panel('主持人提醒', `<div class="panel-body" data-host-notice="${esc(n.id)}"><p>当前议题可能有人还没来得及回应。</p><p class="list-note">只处理这项议题：${esc(decisionById(n.decision)?.title || '当前议题')}</p><div class="actions"><button class="primary small" data-notice="${esc(n.id)}" data-notice-action="confirm">确认</button><button class="small" data-notice="${esc(n.id)}" data-notice-action="ignore">忽略</button></div></div>`)).join('');
+}
+function expressionPanel() {
+  const s = state.snapshot;
+  if (!s || s.role === 'board') return '';
+  if (s.role === 'host') return hostNoticePanel();
+  return panel('我的表达信号', `<div class="panel-body"><div id="signal-readout">${signalBody(state.vision)}</div><p class="list-note">原始画面不离开这台设备。状态不确定时不会提醒主持人。</p></div>`);
+}
+function applyVision(view) {
+  const previous = signalText(state.vision);
+  const was = Boolean(state.vision?.confident);
+  state.vision = view;
+  state.visionHint = view?.confident ? view.kind : view ? 'unknown' : null;
+  if (previous !== signalText(view) || was !== Boolean(view?.confident)) render();
+  else paintSignal(view);
+  publishExpression(view);
+}
+function publishExpression(view) {
+  if (!state.session || !state.snapshot || state.snapshot.role === 'board') return;
+  const payload = {
+    kind: view?.confident && (view.kind === 'speak' || view.kind === 'wait') ? view.kind : view ? 'unknown' : null,
+    confident: Boolean(view?.confident && (view.kind === 'speak' || view.kind === 'wait')),
+    summary: (view?.summary || '').slice(0, 80)
+  };
+  if (!state.snapshot.me?.consent?.camera && payload.kind) return;
+  const key = JSON.stringify(payload);
+  if (key === state.expressionKey) return;
+  state.expressionKey = key;
+  clearTimeout(state.expressionTimer);
+  api(route('/me/expression'), payload).then(() => {
+    if (payload.confident) state.expressionTimer = setTimeout(() => {
+      state.expressionKey = '';
+      publishExpression(state.vision);
+    }, 2000);
+  }).catch(error => {
+    state.expressionKey = '';
+    toast(error.message);
+  });
+}
 function visionHintPanel() {
-  if (!state.visionHint) return '';
-  const waiting=state.visionHint==='wait'||Boolean(state.review)||Boolean(speech.current);
-  return panel('仅你可见的动作建议',`<div class="panel-body"><p class="small-text">${waiting?'你仍在回看或动作接近“希望等待”的个人示例，需要留一点时间吗？':'动作接近你记录的“准备发言”，是否想补充当前议题？'}</p><div class="actions"><button class="small primary" data-request="${waiting?'wait':'speak'}">${waiting?'请等我读／听完':'我想接着说'}</button><button class="small" data-action="dismiss-vision">这次不用</button></div></div>`);
+  if (!state.vision || state.vision.kind === 'listen') return '';
+  const waiting = state.vision.kind === 'wait' || state.vision.kind === 'unknown' || Boolean(state.review) || Boolean(speech.current);
+  const title = state.vision.confident ? '你可以现在回应' : '仅你可见';
+  return panel(title, `<div class="panel-body"><p class="small-text">${state.vision.confident ? '持续信号只留在本机。若你授权了提醒，主持人只会看到“当前议题可能有人还没来得及回应”，不会看到你的姓名。' : '这次动作还不能确认，系统不会提醒主持人。'}</p><div class="actions"><button class="small primary" data-request="${waiting ? 'wait' : 'speak'}">${waiting ? '请等我读／听完' : '我想接着说'}</button><button class="small" data-action="dismiss-vision">这次不用</button></div></div>`);
 }
 function playerPanel() {
   return panel('本地语音播报', `<div class="panel-body"><div class="player"><div class="row between"><div class="wave ${speech.active?'playing':''}">${'<i></i>'.repeat(14)}</div><span class="tag neutral">${speech.active?'播放中':speech.enabled?'等待新字幕':'未开启'}</span></div><p>${esc(speech.message)}</p></div><div class="actions"><button class="${speech.enabled?'':'primary'}" data-action="speech">${speech.enabled?'关闭播报':'开启播报'}</button><button class="small" data-action="speech-replay">重播现有原句</button></div><label class="form-label" for="speech-rate" style="margin-top:18px">语速</label><select id="speech-rate"><option value="0.8">稍慢 · 0.8 倍</option><option value="1">正常 · 1 倍</option><option value="1.2">稍快 · 1.2 倍</option></select><p class="list-note">主机使用本地中文音色合成，成员端按句播放。只有真实排队和播放状态参与留位。</p></div>`);
@@ -384,7 +454,7 @@ function decisions() {
 
 function responses() {
   const s = state.snapshot;
-  return head(s.role === 'host' ? '回应工作台' : '我的回应', s.role === 'host' ? '把“已经看到”与“已经处理”分别记录。' : '查看自己的请求、已提交意见以及最终处理结果。', '<button class="primary" data-action="compose">写一条补充</button>') + `<div class="columns"><div>${panel('已经提交的补充意见',s.contributions.length?`<div class="panel-body">${s.contributions.map(c=>`<article class="contribution"><div class="row between"><b>${esc(decisionById(c.decision)?.title||'独立意见')}</b>${tag(c.status)}</div><p>${esc(c.text)}</p>${c.quote?`<div class="quote">${esc(segmentById(c.quote.segment)?.text||'')}</div>`:''}${c.resolution?`<div class="hint">${esc(actions[c.resolution.action])} · ${esc(c.resolution.reason)}</div>`:s.role==='host'&&c.decision?`<button class="small" data-resolve="${c.decision}" data-resolve-action="maintain">处理关联议题</button>`:s.role==='host'?`<button class="small" data-reply="${c.id}">回复这条意见</button>`:'<span class="muted small-text">等待主持人回应</span>'}</article>`).join('')}</div>`:empty('还没有补充意见','想法准备好后，选择对应原议题或作为独立意见提交。'))}</div><aside>${panel(s.role==='host'?'待回应请求':'我的请求',s.requests.length?`<div class="panel-body">${s.requests.slice().reverse().map(q=>`<article class="notice-card"><div class="row between"><h3>${kinds[q.kind]}</h3>${tag(q.status)}</div><p>${esc(decisionById(q.decision)?.title||'当前讨论')}</p><p class="muted">${q.source==='auto'?'按本人预授权留位':'本人主动发起'}${q.closed_reason?' · '+esc(q.closed_reason):''}</p>${['delivered','seen'].includes(q.status)?`<div class="actions">${s.role==='host'?`<button class="small" data-request-id="${q.id}" data-request-action="seen">已看到</button><button class="primary small" data-request-id="${q.id}" data-request-action="handled">标记已处理</button>`:`<button class="small" data-request-id="${q.id}" data-request-action="skip">本次略过</button><button class="ghost small" data-request-id="${q.id}" data-request-action="withdraw">撤回</button>`}</div>`:''}</article>`).join('')}</div>`:empty('暂无请求','手动请求与自动留位会在这里显示。'))}</aside></div>`;
+  return head(s.role === 'host' ? '回应工作台' : '我的回应', s.role === 'host' ? '把“已经看到”与“已经处理”分别记录。' : '查看自己的请求、已提交意见以及最终处理结果。', '<button class="primary" data-action="compose">写一条补充</button>') + `<div class="columns"><div>${panel('已经提交的补充意见',s.contributions.length?`<div class="panel-body">${s.contributions.map(c=>`<article class="contribution"><div class="row between"><b>${esc(decisionById(c.decision)?.title||'独立意见')}</b>${tag(c.status)}</div><p>${esc(c.text)}</p>${c.quote?`<div class="quote">${esc(segmentById(c.quote.segment)?.text||'')}</div>`:''}${c.resolution?`<div class="hint">${esc(actions[c.resolution.action])} · ${esc(c.resolution.reason)}</div>`:s.role==='host'&&c.decision?`<button class="small" data-resolve="${c.decision}" data-resolve-action="maintain">处理关联议题</button>`:s.role==='host'?`<button class="small" data-reply="${c.id}">回复这条意见</button>`:'<span class="muted small-text">等待主持人回应</span>'}</article>`).join('')}</div>`:empty('还没有补充意见','想法准备好后，选择对应原议题或作为独立意见提交。'))}</div><aside>${hostNoticePanel()}${panel(s.role==='host'?'待回应请求':'我的请求',s.requests.length?`<div class="panel-body">${s.requests.slice().reverse().map(q=>`<article class="notice-card"><div class="row between"><h3>${kinds[q.kind]}</h3>${tag(q.status)}</div><p>${esc(decisionById(q.decision)?.title||'当前讨论')}</p><p class="muted">${q.source==='vision'?(q.status==='confirmed'?'主持人确认后的表达机会':'表达信号提醒'):q.source==='auto'?'播报或回看自动留位':'本人主动发起'}${q.closed_reason?' · '+esc({skip:'本次略过',withdraw:'已撤回',seen:'主持人已看到',handled:'已处理'}[q.closed_reason]||q.closed_reason):''}</p>${s.role==='host'?(['delivered','seen'].includes(q.status)?`<div class="actions"><button class="small" data-request-id="${q.id}" data-request-action="seen">已看到</button><button class="primary small" data-request-id="${q.id}" data-request-action="handled">标记已处理</button></div>`:''):(['delivered','seen','confirmed'].includes(q.status)?`<div class="actions" data-member-request="${esc(q.id)}">${q.status==='confirmed'?`<button class="primary small" data-compose="${esc(q.decision||'')}">我来表达</button>`:''}<button class="small" data-request-id="${q.id}" data-request-action="skip">本次略过</button><button class="ghost small" data-request-id="${q.id}" data-request-action="withdraw">撤回</button></div>`:'')}</article>`).join('')}</div>`:empty('暂无请求','手动请求、播报回看留位，以及主持人确认后的表达机会，会在这里显示。'))}</aside></div>`;
 }
 
 function recap() {
@@ -396,22 +466,24 @@ function recap() {
 function settings() {
   const s = state.snapshot,
     h = state.health?.capabilities;
-  return head('个人与设备', '选择适合自己的参与方式，随时调整。') + `<div class="columns"><div>${panel('我的自动留位授权',`<div class="panel-body"><form id="consent-form">${consentFields()}<button class="primary" type="submit">保存本场授权</button></form></div>`)}${panel('个人摄像头研究',`<div class="panel-body"><p class="list-note">在本机校准自然坐姿，再分别记录三类由本人示范的动作。系统比较连续动作并给你私人建议，建议可忽略。样例在关闭摄像头时清除。</p><video id="camera-video" class="camera-video" autoplay muted playsinline ${camera?.stream?'':'hidden'}></video><p id="camera-status" class="hint">${esc(camera?.message||'尚未开启，模型资源位于本地。')}</p><div class="actions"><button data-action="camera">${camera?.stream?'关闭摄像头':'授权并开启摄像头'}</button><button data-action="calibrate" ${camera?.stream?'':'disabled'}>校准自然坐姿</button></div><div class="actions"><button class="small" data-vision-sample="listen" ${camera?.stream?'':'disabled'}>记录自然聆听</button><button class="small" data-vision-sample="speak" ${camera?.stream?'':'disabled'}>记录准备发言</button><button class="small" data-vision-sample="wait" ${camera?.stream?'':'disabled'}>记录希望等待</button></div></div>`)}${s.role==='host'?panel('结束本场讨论',`<div class="panel-body"><p class="list-note">结束前请先导出需要保留的决定记录。结束后清空本场原句、意见与临时进度，邀请随即失效。</p><button class="danger" data-action="end">结束并清空房间</button></div>`):''}</div><aside>${playerPanel()}${panel('房间主机能力',`<div class="panel-body"><div class="status-row"><span>中文转写<small>faster-whisper 本地模型</small></span><span class="tag ${h?.asr.ready?'':'neutral'}">${h?.asr.ready?'已配置':'待配置'}</span></div><div class="status-row"><span>语义议题提取<small>${esc(h?.semantic.label||'本地语义模型')}</small></span><span class="tag ${h?.semantic.ready?'':'neutral'}">${h?.semantic.ready?'已配置':'待配置'}</span></div><div class="status-row"><span>语义关联与依据解释</span><span class="tag">可用</span></div><p class="list-note">已配置表示主机设置了模型入口，首次运行仍需验证模型能否加载。手动建项、请求和处理流程可独立使用。</p></div>`)}</aside></div>`;
+  return head('个人与设备', '选择适合自己的参与方式，随时调整。') + `<div class="columns"><div>${panel('播报回看与表达提醒',`<div class="panel-body"><form id="consent-form">${consentFields()}<button class="primary" type="submit">保存本场授权</button></form></div>`)}${panel('本机表达信号',`<div class="panel-body"><p class="list-note">摄像头画面只在本机处理。先校准自然坐姿，再记录自然聆听、准备发言和希望等待。持续信号只显示在这里；另外授权后，也只向主持人发送不点名提醒，不会直接改变议题。</p><div id="signal-readout">${signalBody(state.vision)}</div><video id="camera-video" class="camera-video" autoplay muted playsinline ${camera?.stream?'':'hidden'}></video><p id="camera-status" class="hint">${esc(camera?.message||'尚未开启，模型资源位于本地。')}</p><div class="actions"><button data-action="camera">${camera?.stream?'关闭摄像头':'授权并开启摄像头'}</button><button data-action="calibrate" ${camera?.stream?'':'disabled'}>校准自然坐姿</button></div><div class="actions"><button class="small" data-vision-sample="listen" ${camera?.stream?'':'disabled'}>记录自然聆听</button><button class="small" data-vision-sample="speak" ${camera?.stream?'':'disabled'}>记录准备发言</button><button class="small" data-vision-sample="wait" ${camera?.stream?'':'disabled'}>记录希望等待</button></div></div>`)}${s.role==='host'?panel('结束本场讨论',`<div class="panel-body"><p class="list-note">结束前请先导出需要保留的决定记录。结束后清空本场原句、意见与临时进度，邀请随即失效。</p><button class="danger" data-action="end">结束并清空房间</button></div>`):''}</div><aside>${playerPanel()}${panel('房间主机能力',`<div class="panel-body"><div class="status-row"><span>中文转写<small>FunASR Runtime 2-pass</small></span><span class="tag ${h?.asr.ready?'':'neutral'}">${h?.asr.ready?'已配置':'待配置'}</span></div><div class="status-row"><span>语义议题提取<small>${esc(h?.semantic.label||'本地语义模型')}</small></span><span class="tag ${h?.semantic.ready?'':'neutral'}">${h?.semantic.ready?'已配置':'待配置'}</span></div><div class="status-row"><span>语义关联与依据解释</span><span class="tag">可用</span></div><p class="list-note">已配置表示主机设置了模型入口，首次运行仍需验证模型能否加载。手动建项、请求和处理流程可独立使用。</p></div>`)}</aside></div>`;
 }
 
 function renderBoard() {
   const s = state.snapshot;
-  $('#app').innerHTML = `<main class="board" id="main"><header>${brand()}<span class="connection ${state.online?'':'offline'}">${state.online?'实时同步':'重新连接中'}</span></header><div class="eyebrow">共同讨论 · 共同决定</div><h1>${esc(s.title)}</h1><div class="board-grid">${s.decisions.length?s.decisions.map(d=>`<article class="board-card ${d.status}">${tag(d.status)}<h2>${esc(d.title)}</h2><p>${esc(d.conclusion)}</p>${d.status==='waiting'?'<div class="hint amber">这项议题留有回应机会，大家可以先讨论其他事项。</div>':d.resolutions.length?`<div class="hint">${esc(d.resolutions.at(-1).reason)}</div>`:'<span class="muted">等待主持人确认</span>'}</article>`).join(''):empty('讨论即将开始','这里将显示共同议题及其处理结果。')}</div><footer>公共屏仅展示议题信息。个人阅读、播报进度与草稿仅用于本人授权的流程。</footer></main>`;
+  $('#app').innerHTML = `<main class="board" id="main"><header>${brand()}<span class="connection ${state.online?'':'offline'}">${state.online?'实时同步':'重新连接中'}</span></header><div class="eyebrow">共同讨论 · 共同决定</div><h1>${esc(s.title)}</h1>${s.signals?`<div class="hint amber">有成员出现持续表达信号。这里不显示身份，只提示当前议题是否需要留出回应。</div>`:''}<div class="board-grid">${s.decisions.length?s.decisions.map(d=>`<article class="board-card ${d.status}">${tag(d.status)}<h2>${esc(d.title)}</h2><p>${esc(d.conclusion)}</p>${d.status==='waiting'?'<div class="hint amber">这项议题留有回应机会，大家可以先讨论其他事项。</div>':d.resolutions.length?`<div class="hint">${esc(d.resolutions.at(-1).reason)}</div>`:'<span class="muted">等待主持人确认</span>'}</article>`).join(''):empty('讨论即将开始','这里将显示共同议题及其处理结果。')}</div><footer>公共屏仅展示议题信息。个人阅读、播报进度与草稿仅用于本人授权的流程。</footer></main>`;
 }
 
 function consentFields() {
   const c = state.snapshot.me.consent;
-  return `<label class="check-row"><input type="checkbox" name="playback" ${c.playback?'checked':''}><span>相关依据尚在播报时，替我留位<small>仅在主持人准备定案且设备状态有效时触发。</small></span></label><label class="check-row"><input type="checkbox" name="review" ${c.review?'checked':''}><span>我主动回看相关原句时，替我留位<small>只使用明确选择的回看位置，随时可以返回实时位置。</small></span></label><div class="hint" style="margin:10px 0 20px">公共屏显示议题待回应。你仍然可以略过、撤回或提交自己的补充意见。</div>`;
+  return `<label class="check-row"><input type="checkbox" name="playback" ${c.playback?'checked':''}><span>相关依据尚在播报时，替我留位<small>仅在主持人准备定案且设备状态有效时触发。</small></span></label><label class="check-row"><input type="checkbox" name="review" ${c.review?'checked':''}><span>我主动回看相关原句时，替我留位<small>只使用明确选择的回看位置，随时可以返回实时位置。</small></span></label><label class="check-row"><input type="checkbox" name="camera" ${c.camera?'checked':''}><span>允许在本机分析摄像头<small>只上传表达信号，不上传画面。关闭后立即停止分析。</small></span></label><label class="check-row"><input type="checkbox" name="intervene" ${c.intervene?'checked':''}><span>持续表达信号达到条件时，私下提醒主持人<small>与摄像头授权分开。不显示你的姓名。不确定、未授权或议题尚未准备定案时不会提醒。</small></span></label><div class="hint" style="margin:10px 0 20px">主持人确认后，公共屏只显示这项议题是否留有回应机会，不显示你的身份和画面。你仍然可以不发言、略过、撤回或提交自己的补充意见。</div>`;
 }
 async function saveConsent(data) {
   const next = {
     playback: data.has('playback'),
-    review: data.has('review')
+    review: data.has('review'),
+    camera: data.has('camera'),
+    intervene: data.has('intervene')
   };
   if (!state.online) {
     state.pendingConsent = next;
@@ -664,47 +736,17 @@ document.addEventListener('visibilitychange', () => {
 });
 
 async function startRecording() {
-  if (!state.health?.capabilities.asr.ready) throw new Error('主机尚未准备本地语音模型');
-  const {PhraseMicrophone} = await import('/assets/microphone.js');
-  microphone = new PhraseMicrophone(blob => {
-    if (state.snapshot?.status !== 'open') return;
-    audioQueue.push(blob);
-    if (audioQueue.length >= 2 && state.recording) {
-      stopRecording();
-      toast('正在处理上一段语音，已暂缓新录音。处理完成后可以继续。');
-    }
-    drainAudio();
-  }, message => toast(message));
+  if (!state.health?.capabilities.asr.ready) throw new Error('FunASR 语音服务尚未启动。请先运行启动脚本，确认 10095 端口可用。');
+  const {StreamMicrophone} = await import('/assets/microphone.js');
+  microphone = new StreamMicrophone(state.session, message => toast(message));
   await microphone.start();
   state.recording = true;
   render();
 }
 
-async function drainAudio() {
-  if (audioDraining) return;
-  audioDraining = true;
-  while (audioQueue.length && state.snapshot?.status === 'open') {
-    const blob = audioQueue.shift();
-    try {
-      const result = await api(route('/audio'), blob, 'POST', true);
-      if (result.text) await change('/segments', {
-        text: result.text,
-        source: 'asr',
-        stable: true
-      });
-    } catch (e) {
-      audioQueue.length = 0;
-      stopRecording();
-      toast(e.message);
-      break;
-    }
-  }
-  audioDraining = false;
-}
-
 function stopRecording() {
   state.recording = false;
-  microphone?.stop(state.snapshot?.status === 'open');
+  microphone?.stop();
   microphone = null;
   render();
 }
@@ -769,6 +811,11 @@ document.addEventListener('click', async event => {
       render();
       return;
     }
+    if (button.dataset.notice) {
+      await change(`/notices/${button.dataset.notice}`, {action: button.dataset.noticeAction});
+      toast(button.dataset.noticeAction === 'confirm' ? '已为当前议题保留回应窗口' : '已忽略，当前议题状态不变');
+      return;
+    }
     if (button.dataset.request) {
       await manualDialog(button.dataset.request);
       return;
@@ -800,6 +847,12 @@ document.addEventListener('click', async event => {
         }, 'PATCH');
         modal.close();
       });
+      return;
+    }
+    if (button.dataset.focus) {
+      const d = decisionById(button.dataset.focus);
+      await change(`/decisions/${d.id}/focus`, {version: d.version});
+      toast('已设为当前议题');
       return;
     }
     if (button.dataset.prepare) {
@@ -854,7 +907,13 @@ document.addEventListener('click', async event => {
     if (action === 'consent') consentDialog();
     if (action === 'new-decision') newDecision();
     if (action === 'compose') composeDialog();
-    if (action === 'dismiss-vision') {state.visionHint=null;render();}
+    if (action === 'dismiss-vision') {
+      camera?.suppress(15000);
+      state.visionHint = null;
+      if (state.vision) state.vision = {...state.vision, confident: false, kind: 'unknown'};
+      publishExpression(state.vision);
+      render();
+    }
     if (action === 'end-review') {
       state.review = null;
       await reportProgress();
@@ -938,13 +997,21 @@ document.addEventListener('click', async event => {
         camera.stop();
         render();
       } else {
-        const {
-          PrivateVision
-        } = await import('/assets/vision.js');
+        const consent = state.snapshot.me.consent;
+        if (!consent.camera) {
+          await change('/me/consent', {
+            version: consent.version,
+            playback: consent.playback,
+            review: consent.review,
+            camera: true,
+            intervene: consent.intervene
+          }, 'PUT');
+        }
+        const {PrivateVision} = await import('/assets/vision.js');
         camera = new PrivateVision(message => {
           const el = $('#camera-status');
           if (el) el.textContent = message;
-        }, kind => {state.visionHint=kind;render();});
+        }, applyVision);
         await camera.start();
         render();
       }

@@ -1,9 +1,12 @@
 import asyncio
 import hashlib
 import json
+import ssl
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
+
+import websockets
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -11,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from . import adapters, domain, models
+from .asr_bridge import CaptionAssembler
 from .analysis import AnalysisService
 from .store import Store, require
 
@@ -73,6 +77,10 @@ def create_app(auto_ai=True):
     def consent(room: str, data: models.Consent, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
         return command(request, room, who, idempotency_key, data, lambda r: domain.consent(r, who, data))
 
+    @app.post("/api/v1/rooms/{room}/me/expression")
+    def expression(room: str, data: models.Expression, who=Depends(actor)):
+        return store.apply(room, lambda r: domain.report_expression(r, who, data))
+
     @app.post("/api/v1/rooms/{room}/segments")
     def segment(room: str, data: models.Segment, request: Request, background: BackgroundTasks, who=Depends(actor), idempotency_key: str = Header(default="")):
         result = command(request, room, who, idempotency_key, data, lambda r: domain.add_segment(r, who, data))
@@ -93,6 +101,10 @@ def create_app(auto_ai=True):
     def prepare(room: str, decision_id: str, data: models.Version, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
         return command(request, room, who, idempotency_key, data, lambda r: domain.prepare(r, who, decision_id, data))
 
+    @app.post("/api/v1/rooms/{room}/decisions/{decision_id}/focus")
+    def focus(room: str, decision_id: str, data: models.Version, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
+        return command(request, room, who, idempotency_key, data, lambda r: domain.focus(r, who, decision_id, data))
+
     @app.post("/api/v1/rooms/{room}/presentation")
     def presentation(room: str, data: models.Presentation, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
         return command(request, room, who, idempotency_key, data, lambda r: domain.presentation(r, who, data))
@@ -104,6 +116,12 @@ def create_app(auto_ai=True):
     @app.patch("/api/v1/rooms/{room}/requests/{request_id}")
     def request_action(room: str, request_id: str, data: models.RequestAction, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
         return command(request, room, who, idempotency_key, data, lambda r: domain.act_request(r, who, request_id, data))
+
+    @app.post("/api/v1/rooms/{room}/notices/{notice_id}")
+    def notice_action(room: str, notice_id: str, data: models.NoticeAction, request: Request, who=Depends(actor), idempotency_key: str = Header(default="")):
+        result = command(request, room, who, idempotency_key, data, lambda r: domain.decide_notice(r, who, notice_id, data.action))
+        require(not result.get("rejected"), "提醒已失效", 409)
+        return result
 
     @app.post("/api/v1/rooms/{room}/matches")
     async def matches(room: str, data: models.Match, who=Depends(actor)):
@@ -231,6 +249,94 @@ def create_app(auto_ai=True):
             store.db.execute("DELETE FROM receipts WHERE room=?", (room,))
             return {"status": "closed"}
         return command(request, room, who, idempotency_key, None, clear)
+
+    @app.websocket("/api/v1/rooms/{room}/asr")
+    async def asr_stream(ws: WebSocket, room: str):
+        origin = ws.headers.get("origin")
+        if origin and urlparse(origin).netloc != ws.headers.get("host"):
+            await ws.close(code=1008)
+            return
+        await ws.accept()
+        try:
+            hello = await asyncio.wait_for(ws.receive_json(), timeout=8)
+            who = store.auth(str(hello.get("token", "")), room)
+            domain.host(who)
+            require(store.read(room)["status"] == "open", "讨论已结束", 410)
+        except (asyncio.TimeoutError, HTTPException, ValueError, RuntimeError):
+            await ws.close(code=1008)
+            return
+        url, secure, _, _ = adapters.funasr_target()
+        ssl_context = None
+        if secure:
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        assembler = CaptionAssembler()
+        try:
+            async with websockets.connect(url, ssl=ssl_context, subprotocols=["binary"], ping_interval=20, max_size=8_000_000) as remote:
+                await remote.send(json.dumps({
+                    "mode": "2pass", "chunk_size": [5, 10, 5], "chunk_interval": 10,
+                    "wav_name": "microphone", "is_speaking": True, "wav_format": "pcm",
+                    "audio_fs": 16000, "itn": True,
+                }, ensure_ascii=False))
+
+                async def publish(update):
+                    text, stable = update["text"], update["stable"]
+                    result = store.apply(room, lambda r: domain.live_caption(r, who, text, stable))
+                    if result and result.get("committed"):
+                        asyncio.create_task(analysis.trigger(room))
+
+                async def pump_remote():
+                    while True:
+                        raw = await remote.recv()
+                        if isinstance(raw, bytes):
+                            continue
+                        update = assembler.feed(json.loads(raw))
+                        if update:
+                            await publish(update)
+
+                remote_task = asyncio.create_task(pump_remote())
+                try:
+                    while True:
+                        try:
+                            message = await ws.receive()
+                        except WebSocketDisconnect:
+                            break
+                        if message["type"] == "websocket.disconnect":
+                            break
+                        data = message.get("bytes")
+                        if data:
+                            await remote.send(data)
+                            continue
+                        text = message.get("text")
+                        if text and json.loads(text).get("type") == "stop":
+                            break
+                finally:
+                    try:
+                        await remote.send(json.dumps({"is_speaking": False}))
+                    except (OSError, websockets.exceptions.WebSocketException):
+                        pass
+                    if not remote_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(remote_task), timeout=4)
+                        except (asyncio.TimeoutError, Exception):
+                            remote_task.cancel()
+                    if not remote_task.done():
+                        remote_task.cancel()
+                    try:
+                        await remote_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        except (OSError, websockets.exceptions.WebSocketException, HTTPException, RuntimeError, json.JSONDecodeError):
+            try:
+                await ws.send_json({"type": "error", "message": "FunASR 语音服务暂不可用"})
+            except RuntimeError:
+                pass
+        finally:
+            try:
+                await ws.close()
+            except RuntimeError:
+                pass
 
     @app.websocket("/api/v1/rooms/{room}/events")
     async def events(ws: WebSocket, room: str):

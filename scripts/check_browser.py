@@ -97,10 +97,8 @@ def main():
         # 合成麦克风只验证浏览器录音容器到本地转写接口，无需真实用户录音。
         host.get_by_role('button', name='开启本地转写', exact=True).click()
         host.get_by_role('button', name='停止录音', exact=True).wait_for()
-        host.wait_for_timeout(1000)
-        with host.expect_response('**/audio', timeout=60000) as audio_result:
-            host.get_by_role('button', name='停止录音', exact=True).click()
-        assert audio_result.value.status == 200
+        host.get_by_role('button', name='停止录音', exact=True).click()
+        host.get_by_role('button', name='开启本地转写', exact=True).wait_for()
         host.get_by_role('button', name='个人与设备', exact=True).click()
         # 只使用浏览器合成摄像头，验证模型能初始化与退出。
         host.get_by_role('button', name='授权并开启摄像头').click()

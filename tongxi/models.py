@@ -21,6 +21,14 @@ class Consent(Input):
     version: int = Field(ge=1)
     playback: bool
     review: bool
+    camera: bool = False
+    intervene: bool = False
+
+
+class Expression(Input):
+    kind: Literal["speak", "wait", "listen", "unknown"] | None = None
+    confident: bool = False
+    summary: str = Field(default="", max_length=80)
 
 
 class Segment(Input):
@@ -74,6 +82,10 @@ class ManualRequest(Input):
 
 class RequestAction(Input):
     action: Literal["seen", "handled", "withdraw", "skip"]
+
+
+class NoticeAction(Input):
+    action: Literal["confirm", "ignore"]
 
 
 class Match(Input):

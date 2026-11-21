@@ -1147,6 +1147,26 @@ dialog::backdrop {
   font-size: .8rem !important
 }
 
+.meter {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  gap: 8px;
+  align-items: center;
+  margin: 6px 0
+}
+.meter i {
+  display: block;
+  height: 8px;
+  background: #e3ebe4;
+  border-radius: 99px;
+  overflow: hidden
+}
+.meter b {
+  display: block;
+  height: 100%;
+  background: #2f6f4e
+}
+.signal-meters { margin: 10px 0 4px }
 .camera-video {
   width: 100%;
   border-radius: 10px;

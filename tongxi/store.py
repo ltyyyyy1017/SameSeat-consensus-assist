@@ -59,6 +59,7 @@ class Store:
             room = {"id": room_id, "title": title, "revision": 1, "status": "open",
                     "invite": invite, "created": time.time(), "members": {}, "segments": [],
                     "decisions": [], "requests": [], "contributions": [], "history": [], "demo": False,
+                    "active_decision": None,
                     "ai_enabled": self.auto_ai, "analysis": {"status": "idle", "items": [], "summary": "", "phase": "uncertain", "error": ""}}
             room["members"][member] = self.member(name, "host")
             token = self.session(room_id, member, "host")
@@ -112,6 +113,16 @@ class Store:
                             (room_id, actor["id"], command, fingerprint, json.dumps(result)))
             return result
 
+    def apply(self, room_id, operation):
+        with self.lock, self.db:
+            room = self.load(room_id)
+            require(room["status"] == "open", "讨论已结束", 410)
+            result = operation(room)
+            if result is not None:
+                room["revision"] += 1
+            self.save(room)
+            return result
+
     def connect(self, room_id, actor):
         if actor["role"] == "board":
             return ""
@@ -121,6 +132,9 @@ class Store:
             member = room["members"][actor["id"]]
             epoch = secrets.token_hex(8)
             member.update(epoch=epoch, seq=0, presentation=None, heartbeat=time.monotonic())
+            for request in room["requests"]:
+                if request.get("member") == actor["id"] and request.get("source") == "vision" and request.get("status") == "pending":
+                    request.update(status="expired", closed_reason="连接已更新")
             self.save(room)
             return epoch
 
@@ -141,5 +155,8 @@ class Store:
         with self.lock, self.db:
             room = self.load(room_id)
             if room["status"] == "open" and room["members"][actor["id"]]["epoch"] == epoch:
-                room["members"][actor["id"]].update(presentation=None, epoch="", heartbeat=0)
+                room["members"][actor["id"]].update(presentation=None, epoch="", heartbeat=0, expression=None)
+                for request in room["requests"]:
+                    if request.get("member") == actor["id"] and request.get("source") == "vision" and request.get("status") == "pending":
+                        request.update(status="expired", closed_reason="参与者离开")
                 self.save(room)

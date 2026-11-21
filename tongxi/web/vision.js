@@ -1,20 +1,24 @@
 // 视觉特征与视频仅保留在当前端，不含服务端请求。
 import {PersonalActionModel} from '/assets/vision-policy.js';
 export class PrivateVision {
-  constructor(notify, onHint = () => {}) {
+  constructor(notify, onSignal = () => {}) {
     this.notify = notify;
-    this.onHint = onHint;
+    this.onSignal = onSignal;
     this.model = new PersonalActionModel();
     this.capture = null;
     this.streak = 0;
     this.previous = null;
-    this.lastHint = 0;
     this.stream = null;
     this.face = null;
     this.pose = null;
     this.timer = null;
     this.baseline = null;
     this.last = null;
+    this.kind = null;
+    this.confident = false;
+    this.bars = null;
+    this.mouthStreak = 0;
+    this.suppressedUntil = 0;
     this.message = '正在准备本地视觉模型…';
   }
   update(message) {
@@ -85,6 +89,14 @@ export class PrivateVision {
             pitch: (f[1].y - (f[33].y + f[263].y)/2) / Math.max(.01, Math.abs(f[33].x-f[263].x)),
             turn: (f[1].x - (f[33].x + f[263].x)/2) / Math.max(.01, Math.abs(f[33].x-f[263].x))
           };
+          const frame = this.baseline ? [(this.last.scale/this.baseline.scale-1)/.18, (this.last.mouth-this.baseline.mouth)/.12,
+            (this.last.pitch-this.baseline.pitch)/.2, (this.last.turn-this.baseline.turn)/.2] : [0, 0, 0, 0];
+          this.bars = {
+            mouth: Math.max(0, Math.min(1, frame[1])),
+            lean: Math.max(0, Math.min(1, frame[0])),
+            pitch: Math.max(0, Math.min(1, Math.abs(frame[2]))),
+            turn: Math.max(0, Math.min(1, Math.abs(frame[3])))
+          };
           if (this.baseline) {
             this.observe(t);
           }
@@ -125,15 +137,45 @@ export class PrivateVision {
       return;
     }
     const label = this.model.predict(f);
-    this.streak = label && label === this.previous ? this.streak+1 : 0;
-    this.previous = label;
     const count = Object.keys(this.model.samples).length;
-    this.update(count<3?`已记录 ${count}/3 类动作。请分别记录自然聆听、准备发言和希望等待的示例。`:
-      label?`当前动作接近本人的“${{listen:'自然聆听',speak:'准备发言',wait:'希望等待'}[label]}”示例。`:'当前动作不明确，暂不建议。');
-    if (label && label !== 'listen' && this.streak >= 3 && now-this.lastHint > 12000) {
-      this.lastHint = now;
-      this.onHint(label === 'wait' ? 'wait' : 'speak');
+    let kind = 'unknown';
+    let confident = false;
+    if (label) {
+      this.streak = label === this.previous ? this.streak + 1 : 0;
+      this.previous = label;
+      this.mouthStreak = 0;
+      kind = label;
+      confident = label !== 'listen' && this.streak >= 3;
+    } else {
+      this.streak = 0;
+      this.previous = null;
+      const mouthUp = f[1] > 0.55;
+      if (mouthUp) {
+        this.mouthStreak += 1;
+        kind = 'speak';
+        confident = this.mouthStreak >= 4;
+      } else {
+        this.mouthStreak = 0;
+      }
     }
+    if (now < this.suppressedUntil) confident = false;
+    this.kind = kind;
+    this.confident = confident;
+    const names = {listen: '自然聆听', speak: '准备发言', wait: '希望等待'};
+    if (kind === 'speak' && confident) this.update(count >= 3 && label === 'speak' ? '当前动作接近本人的“准备发言”示例。' : '相对自然坐姿，嘴部张开已持续出现。可能准备发言。');
+    else if (kind === 'wait' && confident) this.update('当前动作接近本人的“希望等待”示例。可能需要等待。');
+    else if (kind === 'listen') this.update('当前动作接近本人的“自然聆听”示例。');
+    else if (count < 3) this.update(`已记录 ${count}/3 类动作。样例未齐时，只有持续的嘴部变化才会形成发言候选。`);
+    else this.update(label ? `当前动作接近本人的“${names[label]}”示例。` : '当前动作不明确，暂不判断。');
+    this.onSignal(this.view());
+  }
+  view() {
+    return {kind: this.kind, confident: this.confident, summary: (this.message || '').slice(0, 80), bars: this.bars};
+  }
+  suppress(ms) {
+    this.suppressedUntil = performance.now() + ms;
+    this.confident = false;
+    this.onSignal(this.view());
   }
   stop() {
     clearTimeout(this.timer);
@@ -148,7 +190,10 @@ export class PrivateVision {
     this.baseline = null;
     this.model = new PersonalActionModel();
     this.capture = null;
-    this.onHint(null);
+    this.kind = null;
+    this.confident = false;
+    this.bars = null;
+    this.onSignal(null);
     this.update('摄像头已关闭，短时动作缓存已清除。');
   }
 }
