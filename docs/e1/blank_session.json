@@ -1,0 +1,48 @@
+{
+  "synthetic": false,
+  "human_pilot_complete": false,
+  "global_reference_ready": false,
+  "global_reference": null,
+  "participants": [
+    {
+      "participant_id": "p00000000",
+      "calibration": {
+        "session_role": "calibration",
+        "calibration_id": "",
+        "duration_ms": null,
+        "baseline": {"scale": null, "mouth": null, "pitch": null, "turn": null},
+        "samples": {"listen": [], "speak": [], "wait": []}
+      },
+      "sessions": [
+        {
+          "session_id": "",
+          "session_role": "test",
+          "frames": [
+            {
+              "participant_id": "p00000000",
+              "session_id": "",
+              "agenda_id": "",
+              "timestamp_ms": null,
+              "feature_vector": null,
+              "raw": {"scale": null, "mouth": null, "pitch": null, "turn": null},
+              "label": null,
+              "label_source": null,
+              "t_intent": null,
+              "t_speech": null,
+              "t_alert": null,
+              "face_count": null,
+              "shoulder_valid": null,
+              "visibility_status": null,
+              "calibration_id": "",
+              "prediction_A": null,
+              "prediction_B": null,
+              "prediction_C": null,
+              "unknown_reason": null
+            }
+          ],
+          "intents": []
+        }
+      ]
+    }
+  ]
+}

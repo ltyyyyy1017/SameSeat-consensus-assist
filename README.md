@@ -6,7 +6,7 @@ Same‑Seat: An inclusive decision‑making assistant for university group delib
 
 ## 当前版本
 
-SameSeat Phase 2B 完整研发版，发布日期 2026-11-22。Git 标签为 `samesite-phase2b-2026-11-22`。这是团队继续研发的工程基线。E1—E4 还没有做，不能把这一版当成已经验证全部创新效果的最终产品。
+SameSeat Phase 2B 完整研发版，发布日期 2026-11-22。Git 标签为 `samesite-phase2b-2026-11-22`。这是团队继续研发的工程基线。E1—E4 的真人实验还没有做，不能把这一版当成已经验证全部创新效果的最终产品。
 
 这一版已经具备：
 
@@ -17,6 +17,8 @@ SameSeat Phase 2B 完整研发版，发布日期 2026-11-22。Git 标签为 `sam
 - 只有短时复核得到准备发言或希望等待，才生成不点名提醒：「当前议题可能有人还没来得及回应。」；
 - 主持人确认后只为当前议题保留回应机会，忽略则议题不变，相同提醒不重复生成；
 - 成员可以自己表达、略过或撤回。系统不强迫发言。
+
+E1 采集工具在实验分支 `experiment/E1-personalized-vision-pilot`，默认关闭。设置 `TONGXI_E1=1` 才出现「此刻我想说」并记录特征；它不提醒主持人，也不改变议题。没有按键不会被写成负样本。通用参照的采集方法还没有确定，`global_reference_ready` 为 false，不能据此开始真人采集。操作说明在 `docs/e1/实验员操作说明.md`。
 
 尚未完成的研究，按这个顺序进行：
 

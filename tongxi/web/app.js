@@ -360,6 +360,10 @@ function render() {
     $('#camera-video').play().catch(() => {});
   }
   updateResponseClocks();
+  if (state.e1 && window.tongxiE1) {
+    window.tongxiE1.afterRender(state);
+    if (camera) camera.onExperimentFrame = window.tongxiE1.recordFrame;
+  }
 }
 
 function updateResponseClocks() {
@@ -1144,6 +1148,11 @@ async function init() {
     state.health = await api('/health');
   } catch {
     toast('未连接到房间服务，请用启动脚本运行项目');
+  }
+  state.e1 = Boolean(state.health && state.health.e1);
+  if (state.e1) {
+    const experiment = await import('/assets/e1.js');
+    experiment.attach();
   }
   const room = location.pathname.match(/^\/room\/([^/]+)$/)?.[1];
   if (room) {

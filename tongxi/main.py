@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from . import adapters, domain, models
+from . import adapters, domain, e1, models
 from .asr_bridge import CaptionAssembler
 from .analysis import AnalysisService
 from .store import Store, require
@@ -61,7 +61,7 @@ def create_app(auto_ai=True):
 
     @app.get("/api/v1/health")
     def health():
-        return {"status": "ok", "capabilities": adapters.capabilities()}
+        return {"status": "ok", "capabilities": adapters.capabilities(), "e1": e1.e1_enabled()}
 
     @app.post("/api/v1/rooms")
     def create(data: models.CreateRoom, request: Request):
@@ -458,6 +458,104 @@ def create_app(auto_ai=True):
         finally:
             if who:
                 store.disconnect(room, who, epoch)
+
+    def e1_actor(room, authorization):
+        if not e1.e1_enabled():
+            raise HTTPException(404, "E1 实验模式没有打开")
+        return actor(room, authorization)
+
+    @app.post("/api/v1/rooms/{room}/e1/intents")
+    def e1_intent(room: str, body: dict, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有成员可以记录自己的按键", 403)
+        try:
+            return e1.ExperimentStore().add_intent(room, who["id"], body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/rooms/{room}/e1/intents/{intent_id}")
+    def e1_review(room: str, intent_id: str, body: dict, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有本人可以回顾自己的按键", 403)
+        try:
+            return e1.ExperimentStore().review_intent(room, who["id"], intent_id, body.get("action"))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/rooms/{room}/e1/labels")
+    def e1_label(room: str, body: dict, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有本人可以确认自己的标签", 403)
+        try:
+            return e1.ExperimentStore().add_label(room, who["id"], body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/rooms/{room}/e1/frames")
+    def e1_frames(room: str, body: dict, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有成员可以记录自己的特征", 403)
+        try:
+            return e1.ExperimentStore().add_frames(room, who["id"], body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/rooms/{room}/e1/calibration")
+    def e1_calibration(room: str, body: dict, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有成员可以记录自己的基准", 403)
+        try:
+            return e1.ExperimentStore().add_calibration(room, who["id"], body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/rooms/{room}/e1/speech")
+    def e1_speech(room: str, body: dict, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "host", "只有实验员可以标记实际开口时间；没有观察到就留空", 403)
+        try:
+            return e1.ExperimentStore().mark_speech(room, body.get("participant_id"), body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/v1/rooms/{room}/e1/integrity")
+    def e1_integrity(room: str, session_id: str, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有本人可以核对自己的上传", 403)
+        return e1.ExperimentStore().integrity(room, who["id"], session_id)
+
+    @app.post("/api/v1/rooms/{room}/e1/withdraw")
+    def e1_withdraw(room: str, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有本人可以退出实验", 403)
+        try:
+            return e1.ExperimentStore().withdraw(room, who["id"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/rooms/{room}/e1/reference")
+    def e1_reference(room: str, body: dict, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "host", "只有实验员可以登记通用参照", 403)
+        try:
+            return e1.ExperimentStore().set_reference(room, body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/rooms/{room}/e1/reference/freeze")
+    def e1_freeze(room: str, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "host", "只有实验员可以冻结通用参照", 403)
+        try:
+            return e1.ExperimentStore().freeze_reference(room)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/v1/rooms/{room}/e1/export")
+    def e1_export(room: str, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "host", "只有实验员可以导出", 403)
+        return e1.ExperimentStore().export_room(room)
 
     app.mount("/assets", StaticFiles(directory=ROOT), name="assets")
 

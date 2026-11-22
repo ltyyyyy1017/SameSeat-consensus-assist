@@ -4,6 +4,7 @@ export class PrivateVision {
   constructor(notify, onSignal = () => {}) {
     this.notify = notify;
     this.onSignal = onSignal;
+    this.onExperimentFrame = null;
     this.model = new TemporalActionModel();
     this.window = new FeatureWindow();
     this.schedule = new SenseSchedule();
@@ -33,6 +34,20 @@ export class PrivateVision {
   update(message) {
     this.message = message;
     this.notify(message);
+  }
+  noteExperiment(partial) {
+    if (typeof this.onExperimentFrame !== 'function') return;
+    const raw = this.last ? {scale: this.last.scale, mouth: this.last.mouth, pitch: this.last.pitch, turn: this.last.turn} : null;
+    this.onExperimentFrame(Object.assign({
+      timestamp_ms: Date.now(),
+      raw,
+      face_count: 0,
+      shoulder_valid: false,
+      visibility_status: 'record_error',
+      feature_vector: null,
+      notice: null,
+      elapsed_ms: this.lastElapsed || 0
+    }, partial));
   }
   async start() {
     try {
@@ -85,6 +100,7 @@ export class PrivateVision {
     };
   }
   arm(now = performance.now()) {
+    if (this.capture && this.capture.experiment) return;
     this.timerToken += 1;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -138,6 +154,7 @@ export class PrivateVision {
       if (faces.length !== 1 || !poses.length) {
         this.invalidate();
         this.schedule.observe({now: started, elapsed, faces: faces.length, shoulders: false, mouth: 0, predict: null, ready: false, candidates: null});
+        this.noteExperiment({face_count: faces.length, shoulder_valid: false, visibility_status: faces.length > 1 ? 'multi_face' : faces.length === 0 ? 'no_face' : 'occluded'});
         this.update(faces.length > 1 ? '多人同框，暂不判断。' : '当前画面无法可靠取得本人动作，暂不判断。');
       } else {
         const f = faces[0],
@@ -146,6 +163,7 @@ export class PrivateVision {
         if (width < .08 || Math.min(p[11].visibility, p[12].visibility) < .5) {
           this.invalidate();
           this.schedule.observe({now: started, elapsed, faces: 1, shoulders: false, mouth: 0, predict: null, ready: false, candidates: null});
+          this.noteExperiment({face_count: 1, shoulder_valid: false, visibility_status: 'shoulder'});
           this.update('肩部出框或遮挡，请调整机位。');
         } else {
           const mouth = Math.hypot(f[13].x - f[14].x, f[13].y - f[14].y) / Math.max(.01, Math.hypot(f[33].x - f[263].x, f[33].y - f[263].y));
@@ -187,17 +205,107 @@ export class PrivateVision {
     this.model = new TemporalActionModel();
     this.window.clear();
     this.frames = [];
+    this.sampleToken = (this.sampleToken || 0) + 1;
+    clearTimeout(this.sampleTimer);
     this.capture = null;
     this.streak = 0;
     this.previous = null;
     this.mouthStreak = 0;
     this.onSignal(null);
+    this.noteExperiment({event: 'calibration', raw: {...this.baseline}, face_count: 1, shoulder_valid: true, visibility_status: 'ok'});
     this.update('自然坐姿已校准，开始比较相对动作。');
   }
   record(label) {
     if (!this.baseline) {this.update('请先校准自然坐姿，再记录动作示例。');return;}
+    if (typeof this.onExperimentFrame === 'function') {
+      this.capture = {label, frames: [], started: performance.now(), experiment: true};
+      this.update('E1 样例采集：每 250 毫秒一帧，最多 4 秒，至少 6 帧有效画面。无效帧不计。');
+      this.armExperimentSample();
+      return;
+    }
     this.capture = {label, frames: [], started: performance.now()};
     this.update('请保持你希望表达的动作两秒，样例只留在本机本次会话。');
+  }
+  armExperimentSample() {
+    this.sampleToken = (this.sampleToken || 0) + 1;
+    const token = this.sampleToken;
+    clearTimeout(this.sampleTimer);
+    const step = () => {
+      if (token !== this.sampleToken || !this.capture || !this.capture.experiment) return;
+      if (this.ticking) {
+        this.sampleTimer = setTimeout(step, 40);
+        return;
+      }
+      const age = performance.now() - this.capture.started;
+      if (this.capture.frames.length >= 8 || age >= 4000) {
+        this.finishExperimentSample();
+        return;
+      }
+      this.sampleOnce();
+      if (!this.capture || !this.capture.experiment) return;
+      if (this.capture.frames.length >= 8 || performance.now() - this.capture.started >= 4000) {
+        this.finishExperimentSample();
+        return;
+      }
+      this.sampleTimer = setTimeout(step, 250);
+    };
+    this.sampleTimer = setTimeout(step, 250);
+  }
+  sampleOnce() {
+    if (!this.stream || !this.face || !this.pose || this.ticking) return;
+    this.ticking = true;
+    const started = performance.now();
+    try {
+      const faces = this.face.detectForVideo(this.video, started).faceLandmarks;
+      const poses = this.pose.detectForVideo(this.video, started).landmarks;
+      this.lastElapsed = performance.now() - started;
+      if (faces.length !== 1 || !poses.length) {
+        this.noteExperiment({face_count: faces.length, shoulder_valid: false, visibility_status: faces.length > 1 ? 'multi_face' : faces.length === 0 ? 'no_face' : 'occluded'});
+        return;
+      }
+      const pose = poses[0];
+      const width = Math.hypot(pose[11].x - pose[12].x, pose[11].y - pose[12].y);
+      if (width < .08 || Math.min(pose[11].visibility, pose[12].visibility) < .5) {
+        this.noteExperiment({face_count: 1, shoulder_valid: false, visibility_status: 'shoulder'});
+        return;
+      }
+      const face = faces[0];
+      this.last = {
+        scale: width,
+        mouth: Math.hypot(face[13].x - face[14].x, face[13].y - face[14].y) / Math.max(.01, Math.hypot(face[33].x - face[263].x, face[33].y - face[263].y)),
+        pitch: (face[1].y - (face[33].y + face[263].y) / 2) / Math.max(.01, Math.abs(face[33].x - face[263].x)),
+        turn: (face[1].x - (face[33].x + face[263].x) / 2) / Math.max(.01, Math.abs(face[33].x - face[263].x))
+      };
+      const feature = [(this.last.scale / this.baseline.scale - 1) / .18, (this.last.mouth - this.baseline.mouth) / .12,
+        (this.last.pitch - this.baseline.pitch) / .2, (this.last.turn - this.baseline.turn) / .2];
+      if (feature.every(value => Number.isFinite(value))) this.capture.frames.push(feature);
+    } catch {
+      this.update('本机视觉处理暂停，请关闭后重试。');
+    } finally {
+      this.ticking = false;
+    }
+  }
+  finishExperimentSample() {
+    const capture = this.capture;
+    this.capture = null;
+    this.sampleToken = (this.sampleToken || 0) + 1;
+    clearTimeout(this.sampleTimer);
+    if (!capture) return;
+    if (capture.frames.length < 6) {
+      this.noteExperiment({event: 'sample_failed', sample_label: capture.label, reason: '4 秒内有效帧不足 6', face_count: 1, shoulder_valid: false, visibility_status: 'short_sample'});
+      this.update('采集失败：4 秒内没有 6 帧有效画面。这次没有保存，可以重新采集。');
+    } else {
+      const frames = capture.frames.slice(0, 8);
+      try {
+        this.model.train(capture.label, frames);
+        this.noteExperiment({event: 'sample', sample_label: capture.label, sample_frames: frames.map(frame => frame.slice()), face_count: 1, shoulder_valid: true, visibility_status: 'ok'});
+        this.update('已记录本人的动作样例。三类都满 6 帧后才会锁定。');
+      } catch (error) {
+        this.noteExperiment({event: 'sample_failed', sample_label: capture.label, reason: error.message, face_count: 1, shoulder_valid: false, visibility_status: 'short_sample'});
+        this.update(error.message);
+      }
+    }
+    if (this.stream) this.arm(performance.now());
   }
   invalidate() {
     this.streak = 0;
@@ -210,13 +318,18 @@ export class PrivateVision {
     this.onSignal(null);
   }
   observe(now) {
+    if (this.capture && this.capture.experiment) return;
     const f = [(this.last.scale/this.baseline.scale-1)/.18, (this.last.mouth-this.baseline.mouth)/.12,
       (this.last.pitch-this.baseline.pitch)/.2, (this.last.turn-this.baseline.turn)/.2];
     this.window.push(f);
     if (this.capture) {
       this.capture.frames.push(f);
       if (now-this.capture.started >= 2000) {
-        try {this.model.train(this.capture.label,this.capture.frames);this.update('已记录本人的动作样例。三类样例齐全后开始匹配。');}
+        try {
+          this.model.train(this.capture.label, this.capture.frames);
+          this.noteExperiment({event: 'sample', sample_label: this.capture.label, sample_frames: this.capture.frames.map(frame => frame.slice()), face_count: 1, shoulder_valid: true, visibility_status: 'ok'});
+          this.update('已记录本人的动作样例。三类样例齐全后开始匹配。');
+        }
         catch(error) {this.update(error.message);}
         this.capture = null;
       }
@@ -233,6 +346,10 @@ export class PrivateVision {
     const notice = outcome.notice;
     this.kind = notice || label || 'unknown';
     this.confident = Boolean(notice) && now >= this.suppressedUntil;
+    this.noteExperiment({
+      face_count: 1, shoulder_valid: true, visibility_status: 'ok', feature_vector: f.slice(),
+      notice: notice || null
+    });
     if (notice === 'speak') this.update('短时复核得到准备发言，已提交一条不点名提醒。');
     else if (notice === 'wait') this.update('短时复核得到希望等待，已提交一条不点名提醒。');
     else if (label === 'listen') this.update(`观察 ${this.schedule.level}。更接近自然聆听，不会提醒主持人。`);
@@ -249,8 +366,10 @@ export class PrivateVision {
   }
   stop() {
     this.timerToken += 1;
+    this.sampleToken = (this.sampleToken || 0) + 1;
     this.ticking = false;
     clearTimeout(this.timer);
+    clearTimeout(this.sampleTimer);
     this.timer = null;
     this.stream?.getTracks().forEach(t => t.stop());
     this.stream = null;
