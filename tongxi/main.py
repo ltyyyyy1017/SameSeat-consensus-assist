@@ -478,7 +478,7 @@ def create_app(auto_ai=True):
         who = e1_actor(room, authorization)
         require(who["role"] == "member", "只有本人可以回顾自己的按键", 403)
         try:
-            return e1.ExperimentStore().review_intent(room, who["id"], intent_id, body.get("action"))
+            return e1.ExperimentStore().review_intent(room, who["id"], intent_id, body.get("action"), body.get("review_anchor_ms"))
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -533,12 +533,30 @@ def create_app(auto_ai=True):
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
+    @app.post("/api/v1/rooms/{room}/e1/session")
+    def e1_session(room: str, body: dict, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有成员可以开始自己的讨论场次", 403)
+        try:
+            return e1.ExperimentStore().open_session(room, who["id"], body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
     @app.post("/api/v1/rooms/{room}/e1/reference")
     def e1_reference(room: str, body: dict, authorization: str = Header(default="")):
         who = e1_actor(room, authorization)
         require(who["role"] == "host", "只有实验员可以登记通用参照", 403)
         try:
             return e1.ExperimentStore().set_reference(room, body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/rooms/{room}/e1/reference/build")
+    def e1_reference_build(room: str, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "host", "只有实验员可以生成通用参照", 403)
+        try:
+            return e1.ExperimentStore().build_reference(room)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 

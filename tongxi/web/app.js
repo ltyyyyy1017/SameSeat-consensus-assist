@@ -362,7 +362,10 @@ function render() {
   updateResponseClocks();
   if (state.e1 && window.tongxiE1) {
     window.tongxiE1.afterRender(state);
-    if (camera) camera.onExperimentFrame = window.tongxiE1.recordFrame;
+    if (camera) {
+      window.tongxiVision = camera;
+      camera.onExperimentFrame = window.tongxiE1.recordFrame;
+    }
   }
 }
 

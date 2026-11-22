@@ -1,10 +1,17 @@
 {
+  "method": "cohort_neutral_baseline_median_v1",
+  "version": "1.0",
+  "statistic": "componentwise_median",
+  "capture_protocol": "neutral_pose_median_v1",
+  "participant_count": null,
   "values": {
     "scale": null,
     "mouth": null,
     "pitch": null,
     "turn": null
   },
-  "source": "待项目负责人确定采集方法",
-  "version": "unset"
+  "source": "第一次讨论的自然坐姿中位数。不能手填这四个数，也不能用合成数据。",
+  "ready": false,
+  "frozen": false,
+  "scope": "本次 E1 先导队列的共享参照，不是全体大学生的标准坐姿，也不是已经验证的通用人体标准"
 }

@@ -115,20 +115,30 @@ export function attach() {
 export function recordFrame(frame) {
   const state = window.tongxiE1State;
   if (!state || !state.snapshot || state.snapshot.role !== 'member' || !collecting) return;
-  if (frame.event === 'calibration' && frame.raw) {
-    if (sessionRole !== 'calibration') return;
-    sessionStorage.setItem(storageKey('baseline'), JSON.stringify(frame.raw));
+  if (frame.event === 'baseline_failed') {
+    showError(frame.reason || '自然坐姿有效帧不足 24，基准没有更新');
+    return;
+  }
+  if (frame.event === 'baseline_ready' && sessionRole === 'calibration') {
     if (!sessionStorage.getItem(storageKey('cal-start'))) sessionStorage.setItem(storageKey('cal-start'), String(Date.now()));
     const samples = JSON.parse(sessionStorage.getItem(storageKey('samples')) || '{}');
     post('/e1/calibration', {
       session_role: 'calibration',
       calibration_id: sessionId,
-      duration_ms: calibrationDuration(samples),
-      baseline: frame.raw,
+      duration_ms: frame.duration_ms,
+      video_width: frame.video_width,
+      video_height: frame.video_height,
+      attempt: frame.attempt,
+      baseline_measurements: frame.measurements,
       samples
+    }).then(result => {
+      sessionStorage.setItem(storageKey('baseline'), JSON.stringify(result.baseline));
+      if (window.tongxiVision && result.baseline) window.tongxiVision.baseline = result.baseline;
+      showError('自然坐姿已按有效帧的中位数保存。');
     }).catch(error => showError(error.message));
     return;
   }
+  if (frame.event === 'calibration') return;
   if (frame.event === 'sample_failed') {
     showError((frame.sample_label || '样例') + '没有保存：' + (frame.reason || '有效帧不足'));
     return;
@@ -208,9 +218,25 @@ function afterRender(state) {
     if (roleButton) roleButton.addEventListener('click', async () => {
       const ok = await uploadAll();
       if (!ok) return;
+      const video = document.querySelector('#camera-video');
+      const same = window.confirm('第二次讨论要沿用第一次的设备、摄像头、分辨率、机位、距离和光照。现在是否仍然一样？');
+      const nextId = 'e1-' + crypto.randomUUID();
+      try {
+        const opened = await post('/e1/session', {
+          session_id: nextId,
+          session_role: 'test',
+          same_device: same,
+          video_width: video && video.videoWidth || 0,
+          video_height: video && video.videoHeight || 0
+        });
+        if (opened.protocol_deviation) showError('设备和机位与第一次不一致，已标成方案偏差，不会当成标准配对样本。');
+      } catch (error) {
+        showError(error.message);
+        return;
+      }
       sessionRole = 'test';
       sessionStorage.setItem(storageKey('role'), sessionRole);
-      sessionId = 'e1-' + crypto.randomUUID();
+      sessionId = nextId;
       sessionStorage.setItem(storageKey('session'), sessionId);
       presses = [];
       remember();
@@ -220,7 +246,7 @@ function afterRender(state) {
     panel.querySelector('#e1-finish').addEventListener('click', () => finishCollection(state));
     return;
   }
-  panel.innerHTML = `<div class="panel-body"><p class="list-note">实验员只能标记看见的开口。开口不是表达意愿，也不会生成正向标签。通用参照的采集方法还没有确定，不能在这里填四个数冒充真人参照。</p><p class="small-text" id="e1-error"></p><div class="actions"><button type="button" id="e1-speech">记录实际开口时间</button><a class="tag" id="e1-export" href="#">导出 E1 记录</a></div></div>`;
+  panel.innerHTML = `<div class="panel-body"><p class="list-note">实验员只能标记看见的开口。开口不是表达意愿，也不会生成正向标签。通用参照由第一次讨论的坐姿中位数生成，不能在这里填四个数。</p><p class="small-text" id="e1-error"></p><div class="actions"><button type="button" id="e1-speech">记录实际开口时间</button><a class="tag" id="e1-export" href="#">导出 E1 记录</a></div></div>`;
   main.appendChild(panel);
   panel.querySelector('#e1-speech').addEventListener('click', async () => {
     const participant = window.prompt('匿名编号（p 开头）。没有观察到开口就取消。');
@@ -277,27 +303,34 @@ function openReview() {
   const layer = document.createElement('section');
   layer.id = 'e1-review';
   layer.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,32,.72);z-index:30;display:flex;align-items:center;justify-content:center;padding:24px;';
-  const mine = presses.map(item => `<li>${new Date(item.pressed_at_ms || Date.now()).toLocaleTimeString()} <button type="button" data-delete="${item.id}">删除误触</button></li>`).join('') || '<li>这三分钟没有按键。</li>';
-  layer.innerHTML = `<div class="panel" style="max-width:560px"><div class="panel-body"><h2>回顾刚才三分钟</h2><p class="list-note">暂停 20 秒。这里不显示模型判断。不能凭模型或面部动作补写。</p><ul>${mine}</ul><div class="actions"><button type="button" id="e1-add">有未记录的表达意愿</button><button type="button" id="e1-negative">我确认本时间段没有表达意愿</button><button type="button" id="e1-unknown">我无法确定</button></div></div></div>`;
+  const recent = presses.filter(item => {
+    const pressed = item.pressed_at_ms || 0;
+    return pressed >= anchor - REVIEW_MS && pressed <= anchor + 2000;
+  });
+  const mine = recent.map(item => `<li>${new Date(item.pressed_at_ms || Date.now()).toLocaleTimeString()} <button type="button" data-delete="${item.id}">删除误触</button></li>`).join('') || '<li>这三分钟没有按键。</li>';
+  layer.innerHTML = `<div class="panel" style="max-width:560px"><div class="panel-body"><h2>回顾刚才三分钟</h2><p class="list-note">暂停 20 秒。这里不显示模型判断。不能凭模型或面部动作补写。大约在刚才三分钟里的多少秒前，你开始希望表达？说不出时间点就选无法确定。</p><ul>${mine}</ul><div class="actions"><button type="button" id="e1-add">有未记录的表达意愿</button><button type="button" id="e1-negative">我确认本时间段没有表达意愿</button><button type="button" id="e1-unknown">我无法确定</button></div></div></div>`;
   document.body.appendChild(layer);
   const closeLater = window.setTimeout(() => layer.remove(), PAUSE_MS);
   layer.querySelectorAll('[data-delete]').forEach(button => {
     button.addEventListener('click', async () => {
-      await post('/e1/intents/' + button.dataset.delete, {action: 'delete'});
+      await post('/e1/intents/' + button.dataset.delete, {action: 'delete', review_anchor_ms: anchor});
       presses = presses.filter(item => item.id !== button.dataset.delete);
       remember();
       button.parentElement.remove();
     });
   });
   layer.querySelector('#e1-add').addEventListener('click', async () => {
-    const startAgo = window.prompt('大约从几秒前开始？只填刚刚这三分钟里的秒数。');
-    const endAgo = window.prompt('大约到几秒前结束？');
-    if (startAgo === null || endAgo === null) return;
-    const start = anchor - Number(startAgo) * 1000;
-    const end = anchor - Number(endAgo) * 1000;
+    const ago = window.prompt('大约在刚才三分钟里的多少秒前，你开始希望表达？');
+    if (ago === null) return;
+    const seconds = Number(ago);
+    if (!Number.isFinite(seconds) || seconds < 0 || seconds > 180) {
+      showError('说不出一个三分钟内的时间点时，请选择「我无法确定」。');
+      return;
+    }
+    const eventTime = anchor - Math.round(seconds * 1000);
     await post('/e1/labels', {
       action: 'add_positive', session_id: sessionId, session_role: sessionRole,
-      agenda_id: currentAgenda(state), start_timestamp: Math.min(start, end), end_timestamp: Math.max(start, end),
+      agenda_id: currentAgenda(state), start_timestamp: eventTime, end_timestamp: eventTime,
       review_anchor_ms: anchor
     });
     clearTimeout(closeLater);

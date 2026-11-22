@@ -5,9 +5,12 @@
 匹配窗口在看到任何参与者结果之前冻结。
 
 没有按键不再写成 Negative。Negative 只来自参与者对一段具体时间的明确确认。
+回顾补充的 Positive 是一个时间点，不是一段最长三分钟的区间。
+同一时刻不能既是 Positive 又是 Negative。优先级是 Positive、Unknown、Negative。
 V2.1 的停止比较仍是：C 的误报没有低于 A，或 Positive 检出率低超过 10 个百分点。
 误报改为“已确认没有表达意愿的区间里的提醒”，未标注区间单独计数。
 比较只在明确标签盖住至少一半有效观察时间时执行。这是执行条件，不是新的成绩线。
+通用参照使用第一次讨论的个人坐姿中位数，再取参与者之间的中位数。
 applied_to_product 永远为 false。
 """
 import hashlib
@@ -42,8 +45,18 @@ WINDOW_GAP_MS = L3_CONSISTENT_MS
 REVIEW_MS = 180000
 # 执行 V2.1 比较之前的覆盖条件。不是准确率目标，写在看到预演结果之前。
 LABEL_COVERAGE_MIN = 0.5
-# V2.1 没有规定通用参照怎样从真人坐姿采集，因此没有任何方法会使 ready 变成 true。
-REFERENCE_METHODS = ()
+BASELINE_PROTOCOL = "neutral_pose_median_v1"
+BASELINE_MS = 8000
+BASELINE_INTERVAL_MS = 250
+BASELINE_TARGET = 32
+BASELINE_MIN_VALID = 24
+BASELINE_MAX_ATTEMPT = 2
+REFERENCE_METHOD = "cohort_neutral_baseline_median_v1"
+REFERENCE_VERSION = "1.0"
+REFERENCE_METHODS = (REFERENCE_METHOD,)
+COHORT_MIN = 8
+COHORT_MAX = 12
+AXES = ("scale", "mouth", "pitch", "turn")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -68,6 +81,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   member_id TEXT,
   session_id TEXT,
   session_role TEXT,
+  video_width INTEGER,
+  video_height INTEGER,
+  setup_confirmed INTEGER DEFAULT 0,
+  protocol_deviation INTEGER DEFAULT 0,
   PRIMARY KEY (member_id, session_id)
 );
 CREATE TABLE IF NOT EXISTS batches (
@@ -94,7 +111,11 @@ CREATE TABLE IF NOT EXISTS labels (
   label TEXT,
   label_source TEXT,
   confirmation_status TEXT,
-  intent_status TEXT
+  intent_status TEXT,
+  window_anchor INTEGER,
+  superseded INTEGER DEFAULT 0,
+  revised_from TEXT,
+  revised_at TEXT
 );
 CREATE TABLE IF NOT EXISTS speeches (
   id TEXT PRIMARY KEY,
@@ -276,6 +297,101 @@ def _samples_complete(samples):
     return all(WINDOW_MIN <= len(samples.get(label) or []) <= WINDOW_LIMIT for label in ("listen", "speak", "wait"))
 
 
+def _finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
+
+
+def _measurement_raw(item):
+    if not isinstance(item, dict):
+        return None
+    if any(key in item for key in ("name", "image", "video", "audio", "jpeg", "png")):
+        raise ValueError("基准采集不保存画面、录音或姓名")
+    status = item.get("visibility_status", "ok")
+    faces = item.get("face_count", 1)
+    shoulders = item.get("shoulder_valid", True)
+    raw = item.get("raw")
+    if not isinstance(raw, dict):
+        raw = item if "scale" in item else None
+    if status != "ok" or faces != 1 or shoulders is not True or not isinstance(raw, dict):
+        return None
+    if not all(_finite_number(raw.get(key)) for key in AXES):
+        return None
+    return {key: float(raw[key]) for key in AXES}
+
+
+def neutral_baseline(measurements, duration_ms, video_width, video_height, attempt=1):
+    """四维原始值的中位数。不用上一份基准再归一化，也不拿最后一帧代替。"""
+    if not isinstance(measurements, list) or not measurements or len(measurements) > BASELINE_TARGET:
+        return None
+    valid = [raw for raw in (_measurement_raw(item) for item in measurements) if raw]
+    if not BASELINE_MIN_VALID <= len(valid) <= BASELINE_TARGET:
+        return None
+    medians = {key: statistics.median(row[key] for row in valid) for key in AXES}
+    mad = {key: statistics.median(abs(row[key] - medians[key]) for row in valid) for key in AXES}
+    if not all(_finite_number(medians[key]) and _finite_number(mad[key]) for key in AXES):
+        return None
+    if not isinstance(video_width, int) or not isinstance(video_height, int) or video_width <= 0 or video_height <= 0:
+        return None
+    if not isinstance(duration_ms, int) or duration_ms <= 0 or duration_ms > BASELINE_MS + 2000:
+        return None
+    return {
+        **medians,
+        "mad": mad,
+        "target_frames": BASELINE_TARGET,
+        "sampled_frames": len(measurements),
+        "valid_frames": len(valid),
+        "valid_ratio": len(valid) / len(measurements),
+        "duration_ms": duration_ms,
+        "video_width": video_width,
+        "video_height": video_height,
+        "protocol": BASELINE_PROTOCOL,
+        "attempt": attempt,
+    }
+
+
+def _baseline_usable(baseline):
+    if not isinstance(baseline, dict) or baseline.get("protocol") != BASELINE_PROTOCOL:
+        return False
+    if baseline.get("valid_frames") is None or baseline.get("valid_frames") < BASELINE_MIN_VALID:
+        return False
+    if baseline.get("target_frames") != BASELINE_TARGET:
+        return False
+    mad = baseline.get("mad")
+    if not isinstance(mad, dict):
+        return False
+    return all(_finite_number(baseline.get(key)) and _finite_number(mad.get(key)) for key in AXES)
+
+
+def _baseline_values(baseline):
+    if not isinstance(baseline, dict):
+        return None
+    if not all(_finite_number(baseline.get(key)) for key in AXES):
+        return None
+    return {key: baseline[key] for key in AXES}
+
+
+def cohort_reference(baselines):
+    """先每人一个中位数，再在人与人之间取中位数。帧数多的人不会因此更重。"""
+    usable = [item for item in baselines if _baseline_values(item)]
+    if not COHORT_MIN <= len(usable) <= COHORT_MAX:
+        raise ValueError("通用参照需要 8 到 12 名完成第一次自然坐姿校准的参与者")
+    return {key: statistics.median(item[key] for item in usable) for key in AXES}
+
+
+def reference_digest(record):
+    body = {
+        "method": record.get("method"),
+        "version": record.get("version"),
+        "participant_count": record.get("participant_count"),
+        "values": record.get("values"),
+        "statistic": record.get("statistic"),
+        "capture_protocol": record.get("capture_protocol"),
+        "participant_ids": record.get("participant_ids"),
+        "calibration_ids": record.get("calibration_ids"),
+    }
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def _mouth_alerts(frames, mouth_of):
     streak = 0
     armed = False
@@ -387,7 +503,7 @@ def _explicit_labels(session):
             })
     positives, negatives, uncertain = [], [], []
     for item in labels:
-        if item.get("intent_status") == "deleted" or item.get("confirmation_status") == "deleted":
+        if item.get("intent_status") == "deleted" or item.get("confirmation_status") == "deleted" or item.get("superseded"):
             continue
         normalized = {
             "id": item.get("id"),
@@ -444,6 +560,42 @@ def _covered_ms(segments, spans):
         if cursor:
             total += cursor[1] - cursor[0]
     return total
+
+
+def _carve_spans(spans, cuts):
+    remaining = []
+    for start, end in spans:
+        pieces = [(start, end)]
+        for cut_start, cut_end in cuts:
+            nxt = []
+            for lo, hi in pieces:
+                if cut_end <= lo or cut_start >= hi:
+                    nxt.append((lo, hi))
+                    continue
+                if lo < cut_start:
+                    nxt.append((lo, cut_start))
+                if cut_end < hi:
+                    nxt.append((cut_end, hi))
+            pieces = [(lo, hi) for lo, hi in nxt if hi > lo]
+        remaining.extend(pieces)
+    return remaining
+
+
+def _positive_windows(positives):
+    return [(item["start_ms"] - MATCH_LEAD_MS, item["end_ms"] + MATCH_LAG_MS) for item in positives]
+
+
+def _resolved_negative_items(positives, negatives, uncertain):
+    """Positive 的匹配窗口和 Unknown 区间从 Negative 里挖掉。剩下的未确认时间仍是 Unknown。"""
+    spans = _carve_spans([(item["start_ms"], item["end_ms"]) for item in negatives], _positive_windows(positives))
+    spans = _carve_spans(spans, [(item["start_ms"], item["end_ms"]) for item in uncertain])
+    return [{
+        "start_ms": start,
+        "end_ms": end,
+        "label": "negative",
+        "label_source": "explicit_negative_review",
+        "confirmation_status": "confirmed",
+    } for start, end in spans if end > start]
 
 
 def _label_spans(positives, negatives, uncertain):
@@ -546,7 +698,8 @@ def replay(exported):
                 "B": {item["timestamp_ms"] for item in alerts_b},
                 "C": {item["timestamp_ms"] for item in alerts_c},
             }
-            positives, negatives, _uncertain = _explicit_labels(session)
+            positives, negatives, uncertain = _explicit_labels(session)
+            resolved_negatives = _resolved_negative_items(positives, negatives, uncertain)
             copied_frames = []
             for frame in frames_in:
                 copied = dict(frame)
@@ -562,7 +715,7 @@ def replay(exported):
                     copied["label_source"] = "system_unknown"
                     copied["confirmation_status"] = "unconfirmed"
                     copied["unknown_reason"] = frame.get("visibility_status")
-                elif any(item["start_ms"] <= frame["timestamp_ms"] <= item["end_ms"] for item in negatives):
+                elif any(item["start_ms"] <= frame["timestamp_ms"] <= item["end_ms"] for item in resolved_negatives):
                     copied["label"] = "negative"
                     copied["label_source"] = "explicit_negative_review"
                     copied["confirmation_status"] = "confirmed"
@@ -612,7 +765,8 @@ def _person_metrics(person, alerts_override=None):
     unknown_frames = [frame for frame in frames if not _valid(frame)]
     valid_ms, segments = _observation(frames)
     labeled_ms = _covered_ms(segments, _label_spans(positives, negatives, uncertain))
-    negative_ms = _negative_ms(negatives, segments)
+    resolved_negatives = _resolved_negative_items(positives, negatives, uncertain)
+    negative_ms = _negative_ms(resolved_negatives, segments)
     coverage = (labeled_ms / valid_ms) if valid_ms else None
     chosen = alerts_override if alerts_override is not None else person.get("alerts") or {}
     metrics = {
@@ -628,7 +782,7 @@ def _person_metrics(person, alerts_override=None):
         "calibration_ms": person.get("calibration_ms"),
     }
     for condition in ("A", "B", "C"):
-        metrics[condition] = score_alerts(chosen.get(condition) or [], positives, negatives, negative_ms)
+        metrics[condition] = score_alerts(chosen.get(condition) or [], positives, resolved_negatives, negative_ms)
     missing = []
     if person.get("withdrawn"):
         missing.append("withdrawn")
@@ -638,6 +792,8 @@ def _person_metrics(person, alerts_override=None):
         missing.append("no_positive")
     if not negatives:
         missing.append("no_confirmed_negative")
+    if any(session.get("protocol_deviation") for session in test_sessions):
+        missing.append("protocol_deviation")
     return metrics, missing
 
 
@@ -661,12 +817,13 @@ def evaluate(replayed, alerts=None):
             "missing": missing,
             "calibration_ms": person.get("calibration_ms"),
         })
+    counted = [person for person in people if "protocol_deviation" not in person["missing"]]
     micro = {}
     for condition in ("A", "B", "C"):
-        matched = sum(person["metrics"][condition]["matched"] for person in people)
-        confirmed = sum(person["metrics"][condition]["confirmed_false_alarms"] for person in people)
-        positives = sum(person["metrics"]["positive_events"] for person in people)
-        negative_ms = sum(person["metrics"]["negative_ms"] for person in people)
+        matched = sum(person["metrics"][condition]["matched"] for person in counted)
+        confirmed = sum(person["metrics"][condition]["confirmed_false_alarms"] for person in counted)
+        positives = sum(person["metrics"]["positive_events"] for person in counted)
+        negative_ms = sum(person["metrics"]["negative_ms"] for person in counted)
         precision_den = matched + confirmed
         precision = matched / precision_den if precision_den else None
         recall = matched / positives if positives else None
@@ -681,12 +838,12 @@ def evaluate(replayed, alerts=None):
             "matched": matched,
             "confirmed_false_alarms": confirmed,
             "confirmed_false_alarms_per_10_min": (confirmed / negative_ms * 600_000) if negative_ms else None,
-            "unverified_alerts": sum(person["metrics"][condition]["unverified_alerts"] for person in people),
-            "duplicate_alerts": sum(person["metrics"][condition]["duplicate_alerts"] for person in people),
+            "unverified_alerts": sum(person["metrics"][condition]["unverified_alerts"] for person in counted),
+            "duplicate_alerts": sum(person["metrics"][condition]["duplicate_alerts"] for person in counted),
             "unknown_in_scores": False,
         }
-    valid_ms = sum(person["metrics"]["valid_ms"] for person in people)
-    labeled_ms = sum((person["metrics"]["label_coverage"] or 0) * person["metrics"]["valid_ms"] for person in people)
+    valid_ms = sum(person["metrics"]["valid_ms"] for person in counted)
+    labeled_ms = sum((person["metrics"]["label_coverage"] or 0) * person["metrics"]["valid_ms"] for person in counted)
     coverage = (labeled_ms / valid_ms) if valid_ms else None
     claim = "synthetic_tool_check" if replayed.get("synthetic") else "recorded_not_a_finding"
     return {
@@ -694,9 +851,9 @@ def evaluate(replayed, alerts=None):
         "micro": micro,
         "distribution": {
             condition: {
-                "recall": _numbers(people, condition, "recall"),
-                "precision": _numbers(people, condition, "precision"),
-                "confirmed_false_alarms_per_10_min": _numbers(people, condition, "confirmed_false_alarms_per_10_min"),
+                "recall": _numbers(counted, condition, "recall"),
+                "precision": _numbers(counted, condition, "precision"),
+                "confirmed_false_alarms_per_10_min": _numbers(counted, condition, "confirmed_false_alarms_per_10_min"),
             }
             for condition in ("A", "B", "C")
         },
@@ -753,7 +910,7 @@ def reference_record(values, source, version):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "sha256": digest,
         "frozen": False,
-        "ready": method in REFERENCE_METHODS,
+        "ready": False,
     }
 
 
@@ -778,6 +935,7 @@ class ExperimentStore:
 
     def _prepare(self, conn, room):
         conn.executescript(SCHEMA)
+        self._migrate(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute("SELECT value FROM meta WHERE key='migrated'").fetchone()
@@ -790,6 +948,27 @@ class ExperimentStore:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    def _migrate(self, conn):
+        def names(table):
+            return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+        for name, typedef in (
+            ("window_anchor", "INTEGER"),
+            ("superseded", "INTEGER DEFAULT 0"),
+            ("revised_from", "TEXT"),
+            ("revised_at", "TEXT"),
+        ):
+            if name not in names("labels"):
+                conn.execute(f"ALTER TABLE labels ADD COLUMN {name} {typedef}")
+        for name, typedef in (
+            ("video_width", "INTEGER"),
+            ("video_height", "INTEGER"),
+            ("setup_confirmed", "INTEGER DEFAULT 0"),
+            ("protocol_deviation", "INTEGER DEFAULT 0"),
+        ):
+            if name not in names("sessions"):
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {typedef}")
 
     def _import_json(self, conn, document):
         people = document.get("participants") or {}
@@ -865,11 +1044,15 @@ class ExperimentStore:
             raise ValueError("研究编号没有生成")
         return conn.execute("SELECT * FROM people WHERE member_id=?", (member_id,)).fetchone()
 
-    def _session(self, conn, member_id, session_id, session_role):
+    def _session(self, conn, member_id, session_id, session_role, body=None):
         if session_role not in {"calibration", "test"}:
             raise ValueError("讨论只能是第一次建立基准，或第二次独立测试")
         if not session_id:
             raise ValueError("需要场次编号")
+        if session_role == "test":
+            reference = self._reference(conn)
+            if not reference or not reference.get("ready"):
+                raise ValueError("通用参照尚未冻结，不能开始第二次讨论")
         conn.execute(
             "INSERT OR IGNORE INTO sessions(member_id, session_id, session_role) VALUES (?, ?, ?)",
             (member_id, session_id, session_role),
@@ -880,7 +1063,34 @@ class ExperimentStore:
         ).fetchone()
         if row["session_role"] != session_role:
             raise ValueError("同一场次不能改成另一种讨论")
+        if session_role == "test":
+            self._mark_setup(conn, member_id, session_id, body or {})
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE member_id=? AND session_id=?",
+                (member_id, session_id),
+            ).fetchone()
         return row
+
+    def _mark_setup(self, conn, member_id, session_id, body):
+        active = conn.execute(
+            "SELECT baseline FROM calibrations WHERE member_id=? AND active=1",
+            (member_id,),
+        ).fetchone()
+        baseline = json.loads(active["baseline"]) if active and active["baseline"] else {}
+        width = body.get("video_width")
+        height = body.get("video_height")
+        same = body.get("same_device") is True
+        size_matches = (
+            isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0
+            and width == baseline.get("video_width") and height == baseline.get("video_height")
+        )
+        confirmed = 1 if same and size_matches else 0
+        conn.execute(
+            """UPDATE sessions SET video_width=?, video_height=?, setup_confirmed=?, protocol_deviation=?
+               WHERE member_id=? AND session_id=?""",
+            (width if isinstance(width, int) else None, height if isinstance(height, int) else None,
+             confirmed, 0 if confirmed else 1, member_id, session_id),
+        )
 
     def add_intent(self, room, member_id, body):
         if body.get("label_source", "button") != "button":
@@ -890,7 +1100,7 @@ class ExperimentStore:
             raise ValueError("需要毫秒时间戳")
         with self._tx(room) as conn:
             person = self._person(conn, member_id)
-            self._session(conn, member_id, str(body.get("session_id") or ""), body.get("session_role"))
+            self._session(conn, member_id, str(body.get("session_id") or ""), body.get("session_role"), body)
             label_id = "i" + hashlib.sha256(f"{member_id}:{pressed}:{body.get('session_id')}".encode()).hexdigest()[:10]
             conn.execute(
                 """INSERT OR IGNORE INTO labels(id, member_id, session_id, agenda_id, start_ms, end_ms, label, label_source, confirmation_status, intent_status)
@@ -899,13 +1109,15 @@ class ExperimentStore:
             )
         return {"id": label_id, "label": "positive", "label_source": "button", "participant_id": person["participant_id"], "pressed_at_ms": pressed, "confirmation_status": "confirmed"}
 
-    def review_intent(self, room, member_id, intent_id, action):
+    def review_intent(self, room, member_id, intent_id, action, anchor=None):
         if action != "delete":
             raise ValueError("按钮回顾只能删除误触。补充意愿或确认没有意愿要用三分钟回顾。")
         with self._tx(room) as conn:
             row = conn.execute("SELECT * FROM labels WHERE id=? AND member_id=?", (intent_id, member_id)).fetchone()
             if not row or row["label_source"] != "button":
                 raise ValueError("没有这条按键")
+            if isinstance(anchor, int) and not (anchor - REVIEW_MS <= row["start_ms"] <= anchor + 2000):
+                raise ValueError("这次回顾只能处理刚才三分钟里的按键")
             conn.execute("UPDATE labels SET intent_status='deleted', confirmation_status='deleted' WHERE id=?", (intent_id,))
             updated = conn.execute("SELECT * FROM labels WHERE id=?", (intent_id,)).fetchone()
         return {"id": updated["id"], "status": "deleted", "label_source": "button"}
@@ -922,18 +1134,43 @@ class ExperimentStore:
             raise ValueError("回顾区间不能长于三分钟")
         if start < anchor - REVIEW_MS or end > anchor + 2000:
             raise ValueError("回顾只能标刚刚这三分钟，不能补整场")
+        if action == "add_positive" and start != end:
+            raise ValueError("回顾补充的表达意愿只能是一个时间点，不能是一段时间")
         kind = {"add_positive": ("positive", "participant_review", "confirmed"),
                 "confirm_negative": ("negative", "explicit_negative_review", "confirmed"),
                 "uncertain": ("unknown", "participant_review", "uncertain")}[action]
-        label_id = "r" + hashlib.sha256(f"{member_id}:{action}:{start}:{end}".encode()).hexdigest()[:12]
         with self._tx(room) as conn:
             person = self._person(conn, member_id)
-            self._session(conn, member_id, str(body.get("session_id") or ""), body.get("session_role"))
-            conn.execute(
-                """INSERT OR IGNORE INTO labels(id, member_id, session_id, agenda_id, start_ms, end_ms, label, label_source, confirmation_status, intent_status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed')""",
-                (label_id, member_id, str(body.get("session_id")), body.get("agenda_id"), start, end, *kind),
-            )
+            session_id = str(body.get("session_id") or "")
+            self._session(conn, member_id, session_id, body.get("session_role"), body)
+            active = conn.execute(
+                """SELECT * FROM labels
+                   WHERE member_id=? AND session_id=? AND window_anchor=? AND IFNULL(superseded, 0)=0
+                     AND label_source IN ('participant_review', 'explicit_negative_review')""",
+                (member_id, session_id, anchor),
+            ).fetchone()
+            if active and active["label"] == kind[0] and active["start_ms"] == start and active["end_ms"] == end:
+                label_id = active["id"]
+            else:
+                revised_from = None
+                revised_at = None
+                if active:
+                    revised_at = datetime.now(timezone.utc).isoformat()
+                    revised_from = active["id"]
+                    conn.execute(
+                        "UPDATE labels SET superseded=1, revised_at=? WHERE id=?",
+                        (revised_at, active["id"]),
+                    )
+                count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM labels WHERE member_id=? AND session_id=? AND window_anchor=?",
+                    (member_id, session_id, anchor),
+                ).fetchone()["n"]
+                label_id = "r" + hashlib.sha256(f"{member_id}:{session_id}:{anchor}:{count}:{action}:{start}:{end}".encode()).hexdigest()[:12]
+                conn.execute(
+                    """INSERT INTO labels(id, member_id, session_id, agenda_id, start_ms, end_ms, label, label_source, confirmation_status, intent_status, window_anchor, superseded, revised_from, revised_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, 0, ?, ?)""",
+                    (label_id, member_id, session_id, body.get("agenda_id"), start, end, *kind, anchor, revised_from, revised_at),
+                )
         return {
             "id": label_id,
             "participant_id": person["participant_id"],
@@ -952,7 +1189,7 @@ class ExperimentStore:
         with self._tx(room) as conn:
             person = self._person(conn, member_id)
             session_id = str(body.get("session_id") or "")
-            self._session(conn, member_id, session_id, body.get("session_role"))
+            self._session(conn, member_id, session_id, body.get("session_role"), body)
             existing = conn.execute("SELECT batch_id FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
             if existing:
                 stored = conn.execute("SELECT COUNT(*) AS n FROM frames WHERE member_id=? AND session_id=?", (member_id, session_id)).fetchone()["n"]
@@ -985,6 +1222,27 @@ class ExperimentStore:
             stored = conn.execute("SELECT COUNT(*) AS n FROM frames WHERE member_id=? AND session_id=?", (member_id, session_id)).fetchone()["n"]
         return {"duplicate": False, "accepted": accepted, "stored": stored, "participant_id": person["participant_id"]}
 
+    def _resolve_baseline(self, existing, body):
+        attempt = body.get("attempt", 1)
+        if "baseline_measurements" in body:
+            if attempt not in (1, 2):
+                raise ValueError("自然坐姿基准只允许重试一次")
+            computed = neutral_baseline(
+                body.get("baseline_measurements") or [],
+                body.get("duration_ms"),
+                body.get("video_width"),
+                body.get("video_height"),
+                attempt,
+            )
+            if computed is None:
+                raise ValueError("有效帧不足 24，或这次采集不符合 8 秒协议。基准没有更新")
+            return computed
+        if existing and existing["baseline"]:
+            stored = json.loads(existing["baseline"])
+            if _baseline_usable(stored):
+                return stored
+        raise ValueError("单帧不能完成自然坐姿校准")
+
     def add_calibration(self, room, member_id, body):
         if body.get("session_role") != "calibration":
             raise ValueError("第二次讨论不能用来建立个人基准或样例")
@@ -1003,28 +1261,42 @@ class ExperimentStore:
             calibration_id = str(body.get("calibration_id") or "")
             if not calibration_id:
                 raise ValueError("需要校准编号")
+            if active and active["locked"] and active["calibration_id"] == calibration_id:
+                raise ValueError("三类样例已经锁定，不能覆盖")
+            existing = conn.execute(
+                "SELECT * FROM calibrations WHERE member_id=? AND calibration_id=?",
+                (member_id, calibration_id),
+            ).fetchone()
+            if active and active["locked"] and not _samples_complete(incoming):
+                raise ValueError("已锁定的模板不能被一份未完成的校准替换")
+            try:
+                baseline = self._resolve_baseline(existing, body)
+            except ValueError:
+                if active and active["locked"]:
+                    raise ValueError("不完整采集不能覆盖已锁定的自然坐姿基准")
+                raise
+            if not _baseline_usable(baseline):
+                raise ValueError("自然坐姿基准还没有达到 24 帧有效采集，不能建立样例")
             if active and active["locked"]:
-                if active["calibration_id"] == calibration_id:
-                    raise ValueError("三类样例已经锁定，不能覆盖")
-                if not _samples_complete(incoming):
-                    raise ValueError("已锁定的模板不能被一份未完成的校准替换")
-                digest = template_sha(body.get("baseline"), incoming)
+                digest = template_sha(baseline, incoming)
                 conn.execute(
                     """INSERT INTO calibrations(member_id, calibration_id, duration_ms, baseline, samples, locked, active, version, sha256)
                        VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?)""",
-                    (member_id, calibration_id, body.get("duration_ms"), json.dumps(body.get("baseline"), ensure_ascii=False),
+                    (member_id, calibration_id, body.get("duration_ms"), json.dumps(baseline, ensure_ascii=False),
                      json.dumps(incoming, ensure_ascii=False), "later", digest),
                 )
-                return {"participant_id": person["participant_id"], "locked": True, "active_calibration_id": active["calibration_id"], "stored_as": "history"}
+                return {
+                    "participant_id": person["participant_id"],
+                    "locked": True,
+                    "active_calibration_id": active["calibration_id"],
+                    "stored_as": "history",
+                    "baseline": json.loads(active["baseline"]),
+                }
             samples = incoming
             locked = 1 if _samples_complete(samples) else 0
-            digest = template_sha(body.get("baseline"), samples) if locked else None
+            digest = template_sha(baseline, samples) if locked else None
             version = "1" if locked else None
-            existing = conn.execute(
-                "SELECT id FROM calibrations WHERE member_id=? AND calibration_id=?",
-                (member_id, calibration_id),
-            ).fetchone()
-            payload = (body.get("duration_ms"), json.dumps(body.get("baseline"), ensure_ascii=False), json.dumps(samples, ensure_ascii=False), locked, 1 if locked or not active else 0, version, digest, member_id, calibration_id)
+            payload = (body.get("duration_ms"), json.dumps(baseline, ensure_ascii=False), json.dumps(samples, ensure_ascii=False), locked, 1 if locked or not active else 0, version, digest, member_id, calibration_id)
             if existing:
                 conn.execute(
                     """UPDATE calibrations SET duration_ms=?, baseline=?, samples=?, locked=?, active=?, version=?, sha256=?
@@ -1040,7 +1312,7 @@ class ExperimentStore:
             if locked:
                 conn.execute("UPDATE calibrations SET active=0 WHERE member_id=? AND calibration_id<>?", (member_id, calibration_id))
                 conn.execute("UPDATE calibrations SET active=1 WHERE member_id=? AND calibration_id=?", (member_id, calibration_id))
-        return {"participant_id": person["participant_id"], "locked": bool(locked), "active_calibration_id": calibration_id}
+        return {"participant_id": person["participant_id"], "locked": bool(locked), "active_calibration_id": calibration_id, "baseline": baseline}
 
     def mark_speech(self, room, participant_id, body):
         if not participant_id or not isinstance(body.get("t_speech_ms"), int):
@@ -1091,32 +1363,149 @@ class ExperimentStore:
             conn.execute("UPDATE people SET withdrawn=1 WHERE member_id=?", (member_id,))
         return {"participant_id": person["participant_id"], "withdrawn": True}
 
-    def set_reference(self, room, body):
-        record = reference_record(body.get("values") or {}, body.get("source"), body.get("version"))
+    def mark_synthetic(self, room):
         with self._tx(room) as conn:
-            current = conn.execute("SELECT payload FROM reference_row WHERE id=1").fetchone()
-            if current and json.loads(current["payload"]).get("frozen"):
-                raise ValueError("通用参照已经冻结，不能再改")
-            started = conn.execute(
-                """SELECT COUNT(*) AS n FROM frames f JOIN sessions s
-                   ON s.member_id=f.member_id AND s.session_id=f.session_id
-                   WHERE s.session_role='test'"""
-            ).fetchone()["n"]
-            if started:
-                raise ValueError("已经有人开始第二次讨论，不能再设定或修改通用参照")
-            conn.execute("INSERT OR REPLACE INTO reference_row(id, payload) VALUES (1, ?)", (json.dumps(record, ensure_ascii=False),))
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('synthetic', '1')")
+        return {"synthetic": True}
+
+    def _synthetic(self, conn):
+        row = conn.execute("SELECT value FROM meta WHERE key='synthetic'").fetchone()
+        return bool(row and row["value"] == "1")
+
+    def _test_sessions(self, conn):
+        return conn.execute("SELECT COUNT(*) AS n FROM sessions WHERE session_role='test'").fetchone()["n"]
+
+    def _eligible(self, conn):
+        found = []
+        for person in conn.execute("SELECT * FROM people"):
+            if person["withdrawn"]:
+                continue
+            row = conn.execute(
+                "SELECT * FROM calibrations WHERE member_id=? AND active=1 AND locked=1",
+                (person["member_id"],),
+            ).fetchone()
+            if not row or not row["baseline"] or not row["samples"]:
+                continue
+            try:
+                baseline = json.loads(row["baseline"])
+                samples = json.loads(row["samples"])
+            except json.JSONDecodeError:
+                continue
+            if not _baseline_usable(baseline) or not _samples_complete(samples):
+                continue
+            found.append({
+                "participant_id": person["participant_id"],
+                "calibration_id": row["calibration_id"],
+                "baseline": baseline,
+            })
+        found.sort(key=lambda item: item["participant_id"])
+        return found
+
+    def _guard_reference_edit(self, conn):
+        if self._synthetic(conn):
+            raise ValueError("合成数据不能设定真人通用参照")
+        if self._test_sessions(conn):
+            raise ValueError("已经创建第二次讨论，不能再生成或修改通用参照")
+        current = conn.execute("SELECT payload FROM reference_row WHERE id=1").fetchone()
+        if current and json.loads(current["payload"]).get("frozen"):
+            raise ValueError("通用参照已经冻结，不能再改")
+
+    def set_reference(self, room, body):
+        del body
+        raise ValueError("不能用手填的四个数字充当真人通用参照")
+
+    def build_reference(self, room):
+        with self._tx(room) as conn:
+            self._guard_reference_edit(conn)
+            eligible = self._eligible(conn)
+            count = len(eligible)
+            values = None
+            blocked = None
+            deviation = False
+            if count > COHORT_MAX:
+                deviation = True
+                blocked = "超过 12 名有效参与者，记为实验方案偏差，不能截取后冻结"
+            elif count < COHORT_MIN:
+                blocked = "不足 8 名有效参与者，不能生成用于真人比较的通用参照"
+            else:
+                values = json.loads(json.dumps(cohort_reference([item["baseline"] for item in eligible])))
+            record = {
+                "method": REFERENCE_METHOD,
+                "version": REFERENCE_VERSION,
+                "participant_count": count,
+                "participant_ids": [item["participant_id"] for item in eligible],
+                "calibration_ids": [item["calibration_id"] for item in eligible],
+                "values": values,
+                "statistic": "componentwise_median",
+                "capture_protocol": BASELINE_PROTOCOL,
+                "source": "第一次讨论的自然坐姿中位数",
+                "origin": "cohort_build",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "frozen": False,
+                "ready": False,
+                "protocol_deviation": deviation,
+                "blocked_reason": blocked,
+                "scope": "本次 E1 先导队列的共享参照，不是全体大学生的标准坐姿，也不是已经验证的通用人体标准",
+            }
+            record["sha256"] = reference_digest(record) if values else None
+            conn.execute(
+                "INSERT OR REPLACE INTO reference_row(id, payload) VALUES (1, ?)",
+                (json.dumps(record, ensure_ascii=False),),
+            )
         return record
 
     def freeze_reference(self, room):
         with self._tx(room) as conn:
+            if self._synthetic(conn):
+                raise ValueError("合成数据不能冻结为真人通用参照")
+            if self._test_sessions(conn):
+                raise ValueError("已经创建第二次讨论，不能再冻结或修改通用参照")
             current = conn.execute("SELECT payload FROM reference_row WHERE id=1").fetchone()
             if not current:
                 raise ValueError("还没有通用参照")
             record = json.loads(current["payload"])
+            if record.get("origin") != "cohort_build" or record.get("method") not in REFERENCE_METHODS:
+                raise ValueError("真人参照必须来自第一次讨论的有效校准，不能用手填的数字冻结")
+            if record.get("frozen") and record.get("ready"):
+                if record.get("sha256") != reference_digest(record):
+                    raise ValueError("通用参照的 SHA-256 对不上，不能当作已冻结")
+                return record
+            eligible = self._eligible(conn)
+            count = len(eligible)
+            if not COHORT_MIN <= count <= COHORT_MAX:
+                raise ValueError(record.get("blocked_reason") or "有效参与者不是 8 到 12 人，不能冻结")
+            if record.get("protocol_deviation"):
+                raise ValueError("参与者人数超出方案，不能截取后冻结")
+            fresh = json.loads(json.dumps(cohort_reference([item["baseline"] for item in eligible])))
+            ids = [item["participant_id"] for item in eligible]
+            calibrations = [item["calibration_id"] for item in eligible]
+            if record.get("values") != fresh or record.get("participant_ids") != ids or record.get("calibration_ids") != calibrations:
+                raise ValueError("参照和当前第一次讨论的校准不一致，不能冻结")
+            if record.get("statistic") != "componentwise_median" or record.get("capture_protocol") != BASELINE_PROTOCOL:
+                raise ValueError("参照来源不符合已冻结的采集协议")
+            if record.get("version") != REFERENCE_VERSION or not record.get("values"):
+                raise ValueError("参照版本或四维数值不完整")
+            digest = reference_digest(record)
+            if record.get("sha256") != digest:
+                raise ValueError("通用参照的 SHA-256 对不上，不能冻结")
             record["frozen"] = True
-            record["ready"] = record.get("method") in REFERENCE_METHODS
+            record["ready"] = True
             conn.execute("UPDATE reference_row SET payload=? WHERE id=1", (json.dumps(record, ensure_ascii=False),))
         return record
+
+    def open_session(self, room, member_id, body):
+        with self._tx(room) as conn:
+            person = self._person(conn, member_id)
+            row = self._session(conn, member_id, str(body.get("session_id") or ""), body.get("session_role"), body)
+        return {
+            "participant_id": person["participant_id"],
+            "session_id": row["session_id"],
+            "session_role": row["session_role"],
+            "protocol_deviation": bool(row["protocol_deviation"]),
+            "setup_confirmed": bool(row["setup_confirmed"]),
+            "video_width": row["video_width"],
+            "video_height": row["video_height"],
+        }
 
     def _reference(self, conn):
         row = conn.execute("SELECT payload FROM reference_row WHERE id=1").fetchone()
@@ -1169,11 +1558,15 @@ class ExperimentStore:
                                 "end_timestamp": label["end_ms"],
                                 "start_ms": label["start_ms"],
                                 "end_ms": label["end_ms"],
-                                "label": label["label"],
-                                "label_source": label["label_source"],
-                                "confirmation_status": label["confirmation_status"],
-                                "intent_status": label["intent_status"],
-                            }
+                            "label": label["label"],
+                            "label_source": label["label_source"],
+                            "confirmation_status": label["confirmation_status"],
+                            "intent_status": label["intent_status"],
+                            "window_anchor": label["window_anchor"],
+                            "superseded": bool(label["superseded"]),
+                            "revised_from": label["revised_from"],
+                            "revised_at": label["revised_at"],
+                        }
                             labels.append(item)
                             if label["label_source"] == "button":
                                 intents.append({
@@ -1191,6 +1584,10 @@ class ExperimentStore:
                         sessions.append({
                             "session_id": session["session_id"],
                             "session_role": session["session_role"],
+                            "video_width": session["video_width"],
+                            "video_height": session["video_height"],
+                            "setup_confirmed": bool(session["setup_confirmed"]),
+                            "protocol_deviation": bool(session["protocol_deviation"]),
                             "frames": frames,
                             "labels": labels,
                             "intents": intents,

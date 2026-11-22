@@ -17,7 +17,7 @@ def main():
         print("没有可分析的讨论记录。空白表不是结果。")
         return 0
     if not exported.get("synthetic") and not exported.get("global_reference_ready"):
-        print("global_reference_ready=false。通用参照的采集方法还没有确定，不能把这份输出当成真人对照。")
+        print("global_reference_ready=false。第一次讨论的通用参照还没有冻结，不能把这份输出当成真人第二次讨论的对照。")
         return 3
     result = evaluate(replay(exported))
     print(json.dumps(result, ensure_ascii=False, indent=2))

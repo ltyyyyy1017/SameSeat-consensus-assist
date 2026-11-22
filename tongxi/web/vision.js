@@ -195,6 +195,10 @@ export class PrivateVision {
     }
   }
   calibrate() {
+    if (typeof this.onExperimentFrame === 'function') {
+      this.startNeutralBaseline();
+      return;
+    }
     if (!this.last) {
       this.update('请让面部与双肩完整入框后再校准。');
       return;
@@ -225,6 +229,74 @@ export class PrivateVision {
     }
     this.capture = {label, frames: [], started: performance.now()};
     this.update('请保持你希望表达的动作两秒，样例只留在本机本次会话。');
+  }
+  startNeutralBaseline() {
+    if ((this.neutralFailures || 0) >= 2) {
+      this.update('已经重试过一次，仍不足 24 帧有效画面。基准没有更新。');
+      this.noteExperiment({event: 'baseline_failed', reason: '已经重试过一次，仍不足 24 帧有效画面。基准没有更新。', valid_frames: 0});
+      return;
+    }
+    this.sampleToken = (this.sampleToken || 0) + 1;
+    clearTimeout(this.sampleTimer);
+    this.capture = {kind: 'baseline', frames: [], started: performance.now(), experiment: true};
+    this.update('自然坐姿采集 8 秒：每 250 毫秒一帧，至少 24 帧有效。请正对屏幕，嘴部放松，面部和双肩入镜。');
+    this.armNeutralBaseline();
+  }
+  armNeutralBaseline() {
+    this.sampleToken = (this.sampleToken || 0) + 1;
+    const token = this.sampleToken;
+    clearTimeout(this.sampleTimer);
+    const step = () => {
+      if (token !== this.sampleToken || !this.capture || this.capture.kind !== 'baseline') return;
+      if (this.ticking) {
+        this.sampleTimer = setTimeout(step, 40);
+        return;
+      }
+      const age = performance.now() - this.capture.started;
+      if (this.capture.frames.length >= 32 || age >= 8000) {
+        this.finishNeutralBaseline();
+        return;
+      }
+      this.sampleOnce();
+      if (!this.capture || this.capture.kind !== 'baseline') return;
+      if (this.capture.frames.length >= 32 || performance.now() - this.capture.started >= 8000) {
+        this.finishNeutralBaseline();
+        return;
+      }
+      this.sampleTimer = setTimeout(step, 250);
+    };
+    this.sampleTimer = setTimeout(step, 250);
+  }
+  finishNeutralBaseline() {
+    const capture = this.capture;
+    this.capture = null;
+    this.sampleToken = (this.sampleToken || 0) + 1;
+    clearTimeout(this.sampleTimer);
+    if (!capture) return;
+    const valid = capture.frames.filter(frame => frame && frame.raw && ['scale', 'mouth', 'pitch', 'turn'].every(key => Number.isFinite(frame.raw[key])));
+    const attempt = (this.neutralAttempts || 0) + 1;
+    this.neutralAttempts = attempt;
+    if (valid.length < 24) {
+      this.neutralFailures = (this.neutralFailures || 0) + 1;
+      const retry = this.neutralFailures < 2;
+      const reason = retry ? '有效帧不足 24。还可以重新采集一次。这次没有更新基准。' : '重试后仍不足 24 帧。基准没有更新。';
+      this.noteExperiment({event: 'baseline_failed', reason, valid_frames: valid.length, attempt});
+      this.update(reason);
+    } else {
+      this.neutralFailures = 0;
+      this.neutralAttempts = 0;
+      this.noteExperiment({
+        event: 'baseline_ready',
+        measurements: capture.frames.slice(0, 32),
+        duration_ms: Math.min(10000, Math.max(1, Math.round(performance.now() - capture.started))),
+        video_width: this.video && this.video.videoWidth || 0,
+        video_height: this.video && this.video.videoHeight || 0,
+        attempt: Math.min(attempt, 2),
+        valid_frames: valid.length
+      });
+      this.update('正在用有效帧的中位数保存自然坐姿。没有达到 24 帧就不会替换已有基准。');
+    }
+    if (this.stream) this.arm(performance.now());
   }
   armExperimentSample() {
     this.sampleToken = (this.sampleToken || 0) + 1;
@@ -260,13 +332,20 @@ export class PrivateVision {
       const poses = this.pose.detectForVideo(this.video, started).landmarks;
       this.lastElapsed = performance.now() - started;
       if (faces.length !== 1 || !poses.length) {
-        this.noteExperiment({face_count: faces.length, shoulder_valid: false, visibility_status: faces.length > 1 ? 'multi_face' : faces.length === 0 ? 'no_face' : 'occluded'});
+        const visibility = faces.length > 1 ? 'multi_face' : faces.length === 0 ? 'no_face' : 'occluded';
+        this.noteExperiment({face_count: faces.length, shoulder_valid: false, visibility_status: visibility});
+        if (this.capture && this.capture.kind === 'baseline') {
+          this.capture.frames.push({raw: null, face_count: faces.length, shoulder_valid: false, visibility_status: visibility});
+        }
         return;
       }
       const pose = poses[0];
       const width = Math.hypot(pose[11].x - pose[12].x, pose[11].y - pose[12].y);
       if (width < .08 || Math.min(pose[11].visibility, pose[12].visibility) < .5) {
         this.noteExperiment({face_count: 1, shoulder_valid: false, visibility_status: 'shoulder'});
+        if (this.capture && this.capture.kind === 'baseline') {
+          this.capture.frames.push({raw: null, face_count: 1, shoulder_valid: false, visibility_status: 'shoulder'});
+        }
         return;
       }
       const face = faces[0];
@@ -276,6 +355,16 @@ export class PrivateVision {
         pitch: (face[1].y - (face[33].y + face[263].y) / 2) / Math.max(.01, Math.abs(face[33].x - face[263].x)),
         turn: (face[1].x - (face[33].x + face[263].x) / 2) / Math.max(.01, Math.abs(face[33].x - face[263].x))
       };
+      if (this.capture.kind === 'baseline') {
+        this.capture.frames.push({
+          raw: {scale: this.last.scale, mouth: this.last.mouth, pitch: this.last.pitch, turn: this.last.turn},
+          face_count: 1,
+          shoulder_valid: true,
+          visibility_status: 'ok'
+        });
+        return;
+      }
+      if (!this.baseline) return;
       const feature = [(this.last.scale / this.baseline.scale - 1) / .18, (this.last.mouth - this.baseline.mouth) / .12,
         (this.last.pitch - this.baseline.pitch) / .2, (this.last.turn - this.baseline.turn) / .2];
       if (feature.every(value => Number.isFinite(value))) this.capture.frames.push(feature);

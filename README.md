@@ -18,7 +18,7 @@ SameSeat Phase 2B 完整研发版，发布日期 2026-11-22。Git 标签为 `sam
 - 主持人确认后只为当前议题保留回应机会，忽略则议题不变，相同提醒不重复生成；
 - 成员可以自己表达、略过或撤回。系统不强迫发言。
 
-E1 采集工具在实验分支 `experiment/E1-personalized-vision-pilot`，默认关闭。设置 `TONGXI_E1=1` 才出现「此刻我想说」并记录特征；它不提醒主持人，也不改变议题。没有按键不会被写成负样本。通用参照的采集方法还没有确定，`global_reference_ready` 为 false，不能据此开始真人采集。操作说明在 `docs/e1/实验员操作说明.md`。
+E1 采集工具在实验分支 `experiment/E1-personalized-vision-pilot`，默认关闭。设置 `TONGXI_E1=1` 才出现「此刻我想说」并记录特征；它不提醒主持人，也不改变议题。没有按键不会被写成负样本。个人基准在实验模式下改为 8 秒、至少 24 帧的四维中位数。通用参照使用 `cohort_neutral_baseline_median_v1`，要等 8 到 12 名第一次讨论的有效校准冻结后，`global_reference_ready` 才会变成 true。在此之前不能开始第二次讨论。操作说明在 `docs/e1/实验员操作说明.md`。
 
 尚未完成的研究，按这个顺序进行：
 
