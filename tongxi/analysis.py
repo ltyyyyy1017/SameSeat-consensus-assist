@@ -59,6 +59,7 @@ class AnalysisService:
                 source = fingerprint(room)
                 self.write(room_id, {"status": "running", "items": [], "error": ""})
                 started = time.monotonic()
+                requested_at = time.time()
                 raw = await run_in_threadpool(adapters.analyze_discussion, room, self.semantic)
                 latest = self.store.read(room_id)
                 if latest["status"] != "open":
@@ -72,6 +73,9 @@ class AnalysisService:
                 self.write(room_id, {"status": "ready", "items": valid_items(latest, raw.get("items", [])),
                     "phase": raw.get("phase") if raw.get("phase") in {"discussing", "seeking_response", "closing", "uncertain"} else "uncertain",
                     "summary": str(raw.get("summary", ""))[:160], "source": source,
+                    "input_ids": list(raw.get("input_ids") or []),
+                    "input_texts": [str(text)[:1500] for text in raw.get("input_texts") or []],
+                    "requested_at": requested_at,
                     "elapsed_ms": round((time.monotonic()-started)*1000), "updated_at": time.time(),
                     "provider": adapters.capabilities()["semantic"]["label"], "error": ""})
                 return

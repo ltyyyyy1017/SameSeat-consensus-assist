@@ -184,6 +184,8 @@ def analyze_discussion(room, local):
               "不能自己编造结论，不能引入对话从未出现的方案或日期。对话="
               + json.dumps(segments, ensure_ascii=False))
     result = generate_json(local, prompt, schema)
+    result["input_ids"] = [s["id"] for s in stable]
+    result["input_texts"] = [s["text"] for s in stable]
     result["items"] = extract_candidates(segments, result.get("items", []))
     for item in result["items"]:
         for evidence in item["evidence"]:

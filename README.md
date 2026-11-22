@@ -4,6 +4,48 @@ Same‑Seat: An inclusive decision‑making assistant for university group delib
 
 这份代码基于《同席 V1.2 比赛版策划书》，包含主持人工作台、成员端、公共屏，以及相应的房间与状态服务。默认使用本机服务和临时 SQLite 数据库，服务重启后房间清空。
 
+## 当前版本
+
+SameSeat Phase 2B 完整研发版，发布日期 2026-11-22。Git 标签为 `samesite-phase2b-2026-11-22`。这是团队继续研发的工程基线。E1—E4 还没有做，不能把这一版当成已经验证全部创新效果的最终产品。
+
+这一版已经具备：
+
+- FunASR Runtime 连续转写，稳定字幕进入本地 Qwen 1.5B；
+- MediaPipe 面部与姿态关键点、个人基准、FeatureWindow 和 TemporalActionModel；
+- L1（1000 毫秒）、L2（250 毫秒）、L3（100 毫秒，最长 2 秒）自适应观察；
+- 议题阶段变化后，取消旧定时器并按最近一次采样重排；
+- 只有短时复核得到准备发言或希望等待，才生成不点名提醒：「当前议题可能有人还没来得及回应。」；
+- 主持人确认后只为当前议题保留回应机会，忽略则议题不变，相同提醒不重复生成；
+- 成员可以自己表达、略过或撤回。系统不强迫发言。
+
+尚未完成的研究，按这个顺序进行：
+
+1. E1 真人视觉特征与个体化识别；
+2. E2 自适应感知对照；
+3. E3 主持人确认效果；
+4. E4 意见关联与结项。
+
+真人三类样例目前仍可能因为类别边际 0.25 而保持未知。未知不产生提醒，也不要为了发出提醒去降低这个边际。
+
+## 组员如何取得这份代码
+
+新组员：
+
+```bash
+git clone https://github.com/ltyyyyy1017/SameSeat-consensus-assist.git
+```
+
+克隆后的默认分支 `main` 就是这一版。
+
+已经在开发的组员先保存自己的未提交修改，再快进更新，不要覆盖本地工作：
+
+```bash
+git switch main
+git pull --ff-only origin main
+```
+
+也可以从 GitHub Release「SameSeat Phase 2B｜完整研发版本」下载源码包。模型权重、虚拟环境和 FunASR 运行时不在这个仓库里，下载源码后仍要按下一节准备环境。
+
 ## 立即打开
 
 在已完成环境准备的电脑上，双击 **[启动同席.cmd](./启动同席.cmd)**，然后访问 **http://127.0.0.1:8765**。当前开发电脑已完成准备。首次克隆仓库后，请先按下方“从源码建立环境”安装依赖及下载模型。首次使用摄像头或麦克风仍需浏览器授权。
@@ -32,7 +74,7 @@ Same‑Seat: An inclusive decision‑making assistant for university group delib
 | 自动留位 | 按成员授权、定案轮次、有效原句版本、队列或主动回看状态联合判断；公共卡按议题聚合 |
 | 手动请求 | 等待、澄清、接话；区分已送达、已看到、已处理；本人可以略过或撤回 |
 | 意见处理 | 本地 ONNX 语义向量召回，加 Qwen 逐议题判断补充关系，展示引用原句及可能影响的前提；成员确认或改选 |
-| 表达信号 | 本机摄像头经 MediaPipe 提取面部与上身特征，对照个人坐姿和动作样例，显示可能准备发言、希望补充、需要等待或状态不确定。摄像头授权与提醒授权分开。信号只形成不写姓名的私密提醒；主持人确认后，才为发出信号的成员打开当前议题的回应入口 |
+| 表达信号 | 本机摄像头经 MediaPipe 提取面部与上身特征。L1/L2/L3 按议题阶段调整采样，上下文变化会立刻重排下一次采样。只有短时复核得到准备发言或希望等待，才形成不写姓名的私密提醒。主持人确认后只为当前议题保留回应机会，忽略则不改变议题。摄像头授权与提醒授权分开 |
 | 同步与一致性 | SQLite 写事务、命令幂等、决定版本冲突检查、WebSocket 按角色发送最新快照、心跳与过期证据处理 |
 | 隐私和导出 | 公共投影字段白名单；原始录音和视频默认不落盘；导出前核对版本、排除个人进度与凭证 |
 
@@ -58,7 +100,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1
 
 - **语义**优先识别 .runtime/qwen-1.5b.gguf，兼容已有的 qwen.gguf。第一次分析时启动 .runtime/llama/llama-server.exe 独立 CPU 进程，监听随机回环端口，应用正常退出时关闭。预置模型为 Qwen2.5-1.5B-Instruct Q4_K_M。若使用已有 Ollama，可设置 TONGXI_MODEL 为实际本地模型名，服务改用 127.0.0.1:11434。两种入口均绕过代理，避免本机请求意外送到代理服务器。
 - **关联检索**使用 .runtime/embedding 中的多语言 MiniLM ONNX 模型，按语义召回候选，再由本地语言模型逐一判断。无法运行语义服务时明确标记词组检索降级。模型判断仍可能出错，提交前保留改选和独立意见入口。
-- **转写**的会议页使用 FunASR Runtime。浏览器把 16 kHz PCM 连续送到本服务的 `/asr`，再转发到 `127.0.0.1:10095` 的官方 2-pass WebSocket。`2pass-online` 只更新同一条临时字幕，不进入 Qwen。`2pass-offline` 在原句上替换为稳定字幕，版本号保持为 1，然后才进入原有稳定字幕分析。主持人的“修订”才会增加版本。启动脚本发现 10095 未监听时，会尝试使用仓库上一级的 `03_语音评测\ASR接入测试`。该目录不在本仓库内。也可以用 `TONGXI_FUNASR_ROOT`、`TONGXI_FUNASR_PYTHON`、`TONGXI_FUNASR_SERVER`、`TONGXI_FUNASR_CACHE` 指定本机路径。仓库同时保留 SenseVoice 字幕流：`tongxi/asr.py`、`scripts/setup_asr.py` 和 `/caption-stream`。运行 `scripts/setup_asr.py` 后，该接口可以按句写入原句；会议页目前不走这条路径。
+- **转写**的会议页使用 FunASR Runtime。浏览器把 16 kHz PCM 连续送到本服务的 `/asr`，再转发到 `127.0.0.1:10095` 的官方 2-pass WebSocket。`2pass-online` 只更新同一条临时字幕，不进入 Qwen。`2pass-offline` 在原句上替换为稳定字幕，版本号保持为 1，然后才进入原有稳定字幕分析。主持人的“修订”才会增加版本。启动脚本发现 10095 未监听时，会尝试使用仓库上一级的 `03_语音评测\ASR接入测试`。该目录不在本仓库内。也可以用 `TONGXI_FUNASR_ROOT`、`TONGXI_FUNASR_PYTHON`、`TONGXI_FUNASR_SERVER`、`TONGXI_FUNASR_CACHE` 指定本机路径。官方示例音频默认位于 `$TONGXI_FUNASR_ROOT\cache\samples\asr_example_zh.wav`，也可以用 `TONGXI_FUNASR_SAMPLE` 指向它。这些路径都由环境变量决定，仓库里不写某台电脑的绝对路径。仓库同时保留 SenseVoice 字幕流：`tongxi/asr.py`、`scripts/setup_asr.py` 和 `/caption-stream`。运行 `scripts/setup_asr.py` 后，该接口可以按句写入原句；会议页目前不走这条路径。
 - **中文播报**使用 Windows 的中文 System.Speech 音色。本机已确认有 Microsoft Huihui Desktop。其他 Windows 主机如缺失中文音色，需先通过系统设置安装。成员设备只需能够播放 WAV。
 - **视觉**依赖 assets/vendor 的本地 WASM 与 task 文件。参与者单独授权后，画面只在浏览器内处理。个人端显示相对自然坐姿的嘴部、前倾、俯仰和转向变化。达到持续条件后，主持人只看到一句不写姓名的提醒，确认或忽略后才进入回应。公共屏只显示有没有待回应需求，不显示身份和画面。浏览器拒绝摄像头时，房间、字幕、手动请求和人工结项仍可使用。
 
@@ -90,8 +132,8 @@ tongxi/
     app.js         三端页面、表达信号、播放器与交互
     style.css      桌面与手机界面
     meeting-theme.css 会议页补充样式
-    vision.js      端侧摄像头、个人基准、表达信号
-    vision-policy.js 个人动作样例与弃判
+    vision.js      端侧摄像头、个人基准、L1/L2/L3 与采样重排
+    vision-policy.js 时序窗口、样例距离和感知级别
     microphone.js  会议页使用的 FunASR 连续 PCM
     caption-microphone.js 保留的 SenseVoice 收音模块
     response-flow.js 回应窗口与意见卡片
@@ -107,12 +149,17 @@ scripts/
   check_models.py  合成中文音频和真实本地推理检查
 docs/
   字幕底座选型与接入.md  SenseVoice 选型记录，保留在仓库中
+  roadmap/同席_Phase2后续遗留问题.md  Phase 2 之后尚未做的事项
 tests/
   test_rooms.py    核心状态、修订、权限与一致性回归测试
   test_response_flow.py 回应窗口、意见答复与导出范围测试
   test_captions.py SenseVoice 字幕流的权限与原句测试
   test_sprint.py   临时字幕、回应入口与 FunASR 示例句测试
   test_notices.py  主持人确认、忽略与匿名提醒测试
+  test_sense_schedule.py L1/L2/L3 状态和真实采样间隔
+  test_reschedule.py 上下文变化后的定时器重排
+  test_vision_window.py 时序窗口长度
+  test_vision_samples.py 现有距离和边际，不代表真人准确率
   test_phase101.py 当前议题、本人回应与连接失效测试
 ```
 
@@ -144,4 +191,4 @@ node scripts/check_client_ai.mjs
 
 成员提交补充前，点击“根据内容查找原议题”。系统先在本机计算语义向量，再比较补充与各项议题，展示候选关系及原句。引用无效、结构不合规或解释与关联标记冲突的结果会被舍弃。语言模型没有确认、但向量召回较接近时，明确标为“可能回应的上下文”，交给本人核对。当前模型的关系标签和解释仍可能错误，含糊指代也可能没有结果。构造案例验证仅覆盖小规模归属回归，仍需积累真实讨论中的误判与漏判。
 
-表达信号在“个人与设备”中开启。先单独勾选摄像头分析，再校准自然坐姿，并记录自然聆听、准备发言和希望等待。样例未齐时，只有持续的嘴部变化会形成发言候选，单独前倾不会触发。信号只生成一条不写姓名的私密提醒，主持人确认后，才给发出信号的成员打开当前议题的回应入口。主持人也可以忽略。没有明确的当前议题时不产生提醒。这个原型还没有经过目标用户试验，不能把关键点提取写成已经准确识别发言意愿。
+表达信号在“个人与设备”中开启。先单独勾选摄像头分析，再校准自然坐姿，并记录自然聆听、准备发言和希望等待。非决策阶段保持 L1。议题进入准备定案，或 Qwen 阶段为征求回应、收束时，进入 L2。连续嘴部变化或样例距离接近准备发言、希望等待时，才进入最长 2 秒的 L3。只有 L3 得到准备发言或希望等待才提醒主持人。样例缺失、边际不足、多人同框、遮挡或单帧过慢都保持未知，不提醒。主持人确认后，当前议题进入待回应；忽略后议题不变，同一轮不再重复这条提醒。成员可以不发言，也可以用「我想接着说」或「请等我读／听完」自己请求。这个原型还没有经过 E1—E4，不能把关键点提取写成已经准确识别发言意愿。

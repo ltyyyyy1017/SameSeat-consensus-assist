@@ -1,10 +1,19 @@
 // 视觉特征与视频仅保留在当前端，不含服务端请求。
-import {TemporalActionModel} from '/assets/vision-policy.js';
+import {FeatureWindow, SenseSchedule, TemporalActionModel} from '/assets/vision-policy.js';
 export class PrivateVision {
   constructor(notify, onSignal = () => {}) {
     this.notify = notify;
     this.onSignal = onSignal;
-    this.model = new PersonalActionModel();
+    this.model = new TemporalActionModel();
+    this.window = new FeatureWindow();
+    this.schedule = new SenseSchedule();
+    this.bindSchedule();
+    this.timerToken = 0;
+    this.ticking = false;
+    this.gaps = [];
+    this.lastTick = 0;
+    this.seenCaptions = new Set();
+    this.captionsReady = false;
     this.capture = null;
     this.streak = 0;
     this.previous = null;
@@ -66,27 +75,77 @@ export class PrivateVision {
       throw new Error('摄像头或本地视觉模型不可用。请检查权限，并运行 scripts/setup_vision.py 准备模型。');
     }
   }
+  bindSchedule() {
+    const schedule = this.schedule;
+    const enter = schedule.enter.bind(schedule);
+    schedule.enter = (level, now, reason) => {
+      const before = schedule.level;
+      enter(level, now, reason);
+      if (schedule.level !== before) this.arm(typeof now === 'number' ? now : performance.now());
+    };
+  }
+  arm(now = performance.now()) {
+    this.timerToken += 1;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (!this.stream || this.ticking) return;
+    const since = this.lastTick ? Math.max(0, now - this.lastTick) : 0;
+    const wait = Math.max(0, this.schedule.interval() - since);
+    const token = this.timerToken;
+    this.plan = this.plan || [];
+    this.plan.push(this.schedule.interval());
+    this.timer = setTimeout(() => {
+      if (token !== this.timerToken || this.ticking) return;
+      this.timer = null;
+      this.tick();
+    }, wait);
+  }
+  setContext(context) {
+    const decision = Boolean(context && context.decision);
+    const ids = context && context.stableIds || [];
+    const now = performance.now();
+    if (!this.captionsReady) {
+      ids.forEach(id => this.seenCaptions.add(id));
+      this.captionsReady = true;
+      this.schedule.setDecision(decision, now);
+      return;
+    }
+    const fresh = ids.filter(id => !this.seenCaptions.has(id));
+    fresh.forEach(id => this.seenCaptions.add(id));
+    if (!fresh.length) this.schedule.setDecision(decision, now);
+    else fresh.forEach(() => this.schedule.noteCaption(decision, now));
+  }
   tick() {
-    if (!this.stream) return;
+    if (!this.stream || this.ticking) return;
+    this.ticking = true;
+    this.timerToken += 1;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    const started = performance.now();
+    if (this.lastTick) this.gaps.push(Math.round(started - this.lastTick));
+    this.lastTick = started;
+    if (this.gaps.length > 48) this.gaps.shift();
+    let elapsed = 0;
     try {
-      const t = performance.now(),
-        faces = this.face.detectForVideo(this.video, t).faceLandmarks;
-      const poses = this.pose.detectForVideo(this.video, t).landmarks;
+      const faces = this.face.detectForVideo(this.video, started).faceLandmarks;
+      const poses = this.pose.detectForVideo(this.video, started).landmarks;
+      elapsed = performance.now() - started;
+      this.lastElapsed = elapsed;
       if (faces.length !== 1 || !poses.length) {
-        this.streak = 0;
-        this.frames = [];
-        this.last = null;
-        this.onHint(null);
-        this.update('当前画面无法可靠取得本人动作，暂不判断。');
+        this.invalidate();
+        this.schedule.observe({now: started, elapsed, faces: faces.length, shoulders: false, mouth: 0, predict: null, ready: false, candidates: null});
+        this.update(faces.length > 1 ? '多人同框，暂不判断。' : '当前画面无法可靠取得本人动作，暂不判断。');
       } else {
         const f = faces[0],
           p = poses[0],
           width = Math.hypot(p[11].x - p[12].x, p[11].y - p[12].y);
         if (width < .08 || Math.min(p[11].visibility, p[12].visibility) < .5) {
-          this.frames = [];
-          this.streak = 0;
-          this.last = null;
-          this.onHint(null);
+          this.invalidate();
+          this.schedule.observe({now: started, elapsed, faces: 1, shoulders: false, mouth: 0, predict: null, ready: false, candidates: null});
           this.update('肩部出框或遮挡，请调整机位。');
         } else {
           const mouth = Math.hypot(f[13].x - f[14].x, f[13].y - f[14].y) / Math.max(.01, Math.hypot(f[33].x - f[263].x, f[33].y - f[263].y));
@@ -105,16 +164,17 @@ export class PrivateVision {
             turn: Math.max(0, Math.min(1, Math.abs(frame[3])))
           };
           if (this.baseline) {
-            this.observe(t);
+            this.observe(started);
           }
         }
       }
     } catch {
       this.update('本机视觉处理暂停，请关闭后重试。');
       this.stop();
-      return;
+    } finally {
+      this.ticking = false;
+      if (this.stream) this.arm(performance.now());
     }
-    this.timer = setTimeout(() => this.tick(), 250);
   }
   calibrate() {
     if (!this.last) {
@@ -125,11 +185,13 @@ export class PrivateVision {
       ...this.last
     };
     this.model = new TemporalActionModel();
+    this.window.clear();
     this.frames = [];
     this.capture = null;
     this.streak = 0;
     this.previous = null;
-    this.onHint(null);
+    this.mouthStreak = 0;
+    this.onSignal(null);
     this.update('自然坐姿已校准，开始比较相对动作。');
   }
   record(label) {
@@ -137,9 +199,20 @@ export class PrivateVision {
     this.capture = {label, frames: [], started: performance.now()};
     this.update('请保持你希望表达的动作两秒，样例只留在本机本次会话。');
   }
+  invalidate() {
+    this.streak = 0;
+    this.mouthStreak = 0;
+    this.previous = null;
+    this.frames = [];
+    this.window.clear();
+    this.capture = null;
+    this.last = null;
+    this.onSignal(null);
+  }
   observe(now) {
     const f = [(this.last.scale/this.baseline.scale-1)/.18, (this.last.mouth-this.baseline.mouth)/.12,
       (this.last.pitch-this.baseline.pitch)/.2, (this.last.turn-this.baseline.turn)/.2];
+    this.window.push(f);
     if (this.capture) {
       this.capture.frames.push(f);
       if (now-this.capture.started >= 2000) {
@@ -149,37 +222,21 @@ export class PrivateVision {
       }
       return;
     }
-    const label = this.model.predict(f);
-    const count = Object.keys(this.model.samples).length;
-    let kind = 'unknown';
-    let confident = false;
-    if (label) {
-      this.streak = label === this.previous ? this.streak + 1 : 0;
-      this.previous = label;
-      this.mouthStreak = 0;
-      kind = label;
-      confident = label !== 'listen' && this.streak >= 3;
-    } else {
-      this.streak = 0;
-      this.previous = null;
-      const mouthUp = f[1] > 0.55;
-      if (mouthUp) {
-        this.mouthStreak += 1;
-        kind = 'speak';
-        confident = this.mouthStreak >= 4;
-      } else {
-        this.mouthStreak = 0;
-      }
-    }
-    if (now < this.suppressedUntil) confident = false;
-    this.kind = kind;
-    this.confident = confident;
-    const names = {listen: '自然聆听', speak: '准备发言', wait: '希望等待'};
-    if (kind === 'speak' && confident) this.update(count >= 3 && label === 'speak' ? '当前动作接近本人的“准备发言”示例。' : '相对自然坐姿，嘴部张开已持续出现。可能准备发言。');
-    else if (kind === 'wait' && confident) this.update('当前动作接近本人的“希望等待”示例。可能需要等待。');
-    else if (kind === 'listen') this.update('当前动作接近本人的“自然聆听”示例。');
-    else if (count < 3) this.update(`已记录 ${count}/3 类动作。样例未齐时，只有持续的嘴部变化才会形成发言候选。`);
-    else this.update(label ? `当前动作接近本人的“${names[label]}”示例。` : '当前动作不明确，暂不判断。');
+    const ready = this.window.ready();
+    const frames = ready ? this.window.ordered() : null;
+    const label = frames ? this.model.predict(frames) : null;
+    const ranked = frames && typeof this.model.rank === 'function' ? this.model.rank(frames) : null;
+    const outcome = this.schedule.observe({
+      now, elapsed: this.lastElapsed || 0, faces: 1, shoulders: true, mouth: f[1],
+      predict: label, ready, candidates: ranked
+    });
+    const notice = outcome.notice;
+    this.kind = notice || label || 'unknown';
+    this.confident = Boolean(notice) && now >= this.suppressedUntil;
+    if (notice === 'speak') this.update('短时复核得到准备发言，已提交一条不点名提醒。');
+    else if (notice === 'wait') this.update('短时复核得到希望等待，已提交一条不点名提醒。');
+    else if (label === 'listen') this.update(`观察 ${this.schedule.level}。更接近自然聆听，不会提醒主持人。`);
+    else this.update(`观察 ${this.schedule.level}。结果不确定时不会提醒主持人。`);
     this.onSignal(this.view());
   }
   view() {
@@ -191,7 +248,10 @@ export class PrivateVision {
     this.onSignal(this.view());
   }
   stop() {
+    this.timerToken += 1;
+    this.ticking = false;
     clearTimeout(this.timer);
+    this.timer = null;
     this.stream?.getTracks().forEach(t => t.stop());
     this.stream = null;
     if (this.video) this.video.srcObject = null;
@@ -202,11 +262,19 @@ export class PrivateVision {
     this.last = null;
     this.baseline = null;
     this.model = new TemporalActionModel();
+    this.window.clear();
     this.frames = [];
     this.capture = null;
     this.kind = null;
     this.confident = false;
     this.bars = null;
+    this.schedule = new SenseSchedule();
+    this.bindSchedule();
+    this.gaps = [];
+    this.plan = [];
+    this.lastTick = 0;
+    this.seenCaptions = new Set();
+    this.captionsReady = false;
     this.onSignal(null);
     this.update('摄像头已关闭，短时动作缓存已清除。');
   }

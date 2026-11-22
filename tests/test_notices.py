@@ -72,12 +72,17 @@ def test_notice_flow_covers_domain_and_http(env=None):
 
         call(client, member, "/me/expression", {"kind": "speak", "confident": True, "summary": "可能希望补充"})
         again = call(client, host, "/snapshot", method="GET")
-        fresh = again["notices"][0]
+        assert again["notices"] == []
+        assert again["decisions"][0]["status"] == "preparing"
+        assert again["decisions"][1]["status"] == "discussing"
+        member_view = call(client, member, "/snapshot", method="GET")
+        assert member_view["context_phase"] == "uncertain"
+        assert "analysis" not in member_view
+
         call(client, host, f'/decisions/{second["id"]}/prepare', {"version": 1})
         switched = call(client, host, "/snapshot", method="GET")
-        assert all(item["id"] != fresh["id"] for item in switched["notices"])
         assert switched["decisions"][0]["status"] == "preparing"
-        call(client, host, f'/notices/{fresh["id"]}', {"action": "confirm"}, status=409)
+        call(client, host, f'/notices/{notice["id"]}', {"action": "confirm"}, status=409)
 
         current = next(item for item in switched["notices"] if item["decision"] == second["id"])
         call(client, member, "/me/consent", {"version": 2, "playback": False, "review": False, "camera": False, "intervene": True}, "PUT")

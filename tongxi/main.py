@@ -416,7 +416,7 @@ def create_app(auto_ai=True):
         finally:
             try:
                 await ws.close()
-            except RuntimeError:
+            except (RuntimeError, WebSocketDisconnect):
                 pass
 
     @app.websocket("/api/v1/rooms/{room}/events")

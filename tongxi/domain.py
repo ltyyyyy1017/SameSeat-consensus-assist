@@ -172,7 +172,7 @@ def create_vision_notice(room, person_id, person, kind):
     if not decision:
         return None
     same_round = [q for q in room["requests"] if q["member"] == person_id and q["decision"] == decision["id"] and q["round"] == decision["round"]]
-    if any(q.get("source") == "vision" and q["status"] in {"pending", "confirmed"} for q in same_round):
+    if any(q.get("source") == "vision" and q["status"] in {"pending", "confirmed", "ignored"} for q in same_round):
         return None
     if any(q["status"] in ACTIVE for q in same_round):
         return None
@@ -564,6 +564,7 @@ def snapshot(room, actor):
                 segments=room["segments"],
                 requests=visible_requests(room, actor),
                 contributions=[c for c in room["contributions"] if actor["role"] == "host" or c["member"] == actor["id"]])
+    base["context_phase"] = (room.get("analysis") or {}).get("phase") or "uncertain"
     if actor["role"] == "host":
         base.update(invite=room["invite"], board_token=room["board_token"], revision=room["revision"], history=room["history"],
                     analysis=room.get("analysis"), ai_enabled=room.get("ai_enabled", True),

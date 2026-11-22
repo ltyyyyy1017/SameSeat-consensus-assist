@@ -1,4 +1,5 @@
 import json
+import os
 import wave
 from pathlib import Path
 from uuid import uuid4
@@ -138,10 +139,22 @@ def test_disconnect_does_not_create_a_second_hold(env):
     assert board["signals"] == 0
 
 
+def funasr_sample():
+    named = os.getenv("TONGXI_FUNASR_SAMPLE")
+    root = os.getenv("TONGXI_FUNASR_ROOT")
+    candidates = []
+    if named:
+        candidates.append(Path(named))
+    if root:
+        candidates.append(Path(root) / "cache" / "samples" / "asr_example_zh.wav")
+    candidates.append(Path(__file__).resolve().parents[1].parent / "03_语音评测" / "ASR接入测试" / "cache" / "samples" / "asr_example_zh.wav")
+    return next((path for path in candidates if path.is_file()), None)
+
+
 def test_live_funasr_offline_text_matches_the_sample_sentence():
-    sample = Path(r"D:\challenge_AI\SameSeat\03_语音评测\ASR接入测试\cache\samples\asr_example_zh.wav")
-    if not sample.is_file():
-        pytest.skip("缺少已缓存的官方示例音频")
+    sample = funasr_sample()
+    if sample is None:
+        pytest.skip("未找到 FunASR 官方示例音频。请设置 TONGXI_FUNASR_ROOT 或 TONGXI_FUNASR_SAMPLE")
     from tongxi.adapters import funasr_ready
     if not funasr_ready():
         pytest.skip("FunASR 10095 未在监听")

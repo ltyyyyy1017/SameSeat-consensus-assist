@@ -152,6 +152,7 @@ async function reload() {
     state.snapshot = await api(route('/snapshot'));
     state.clockOffset = state.snapshot.server_time * 1000 - Date.now();
     applyServerAnalysis();
+    syncSense();
     render();
   }
 }
@@ -211,6 +212,7 @@ function connect() {
       if (before && state.snapshot.requests?.some(q => opened(q) && !before.requests?.some(b => b.id === q.id && opened(b)))) toast('已为当前议题保留一次回应机会，可以继续表达、略过或撤回');
       remember();
       applyServerAnalysis();
+      syncSense();
       render();
       speech.sync();
       if (state.snapshot.status === 'closed') {
@@ -424,8 +426,10 @@ function hostNoticePanel() {
   const s = state.snapshot;
   if (!s || s.role !== 'host') return '';
   const notices = (s.notices || []).filter(n => n.status === 'pending');
-  if (!notices.length) return '';
-  return notices.map(n => panel('主持人提醒', `<div class="panel-body" data-host-notice="${esc(n.id)}"><p>当前议题可能有人还没来得及回应。</p><p class="list-note">只处理这项议题：${esc(decisionById(n.decision)?.title || '当前议题')}</p><div class="actions"><button class="primary small" data-notice="${esc(n.id)}" data-notice-action="confirm">确认</button><button class="small" data-notice="${esc(n.id)}" data-notice-action="ignore">忽略</button></div></div>`)).join('');
+  if (notices.length) return notices.map(n => panel('主持人提醒', `<div class="panel-body" data-host-notice="${esc(n.id)}"><p>当前议题可能有人还没来得及回应。</p><p class="list-note">只处理这项议题：${esc(decisionById(n.decision)?.title || '当前议题')}</p><div class="actions"><button class="primary small" data-notice="${esc(n.id)}" data-notice-action="confirm">确认</button><button class="small" data-notice="${esc(n.id)}" data-notice-action="ignore">忽略</button></div></div>`)).join('');
+  const held = (s.requests || []).find(q => q.source === 'vision' && q.status === 'confirmed' && q.decision === s.active_decision);
+  if (!held) return '';
+  return panel('主持人提醒', `<div class="panel-body" data-host-held="${esc(held.id)}"><p>当前议题已保留回应机会。</p><p class="list-note">只处理这项议题：${esc(decisionById(held.decision)?.title || '当前议题')}</p></div>`);
 }
 function expressionPanel() {
   const s = state.snapshot;
@@ -520,6 +524,10 @@ async function saveConsent(data) {
     version: state.snapshot.me.consent.version,
     ...next
   }, 'PUT');
+  if (!next.camera && camera) {
+    camera.stop();
+    render();
+  }
   toast('本场授权已更新');
   reportProgress();
 }
@@ -797,20 +805,12 @@ async function startRecording() {
   render();
 }
 
-function stopRecording() {
+async function stopRecording() {
   state.recording = false;
   microphone?.stop();
   microphone = null;
+  state.recordingStopping = false;
   render();
-  try {
-    if (state.snapshot?.status === 'open') await capture?.stop();
-    else capture?.abort();
-  } catch (error) {state.captionStatus = error.message; toast(error.message);}
-  finally {
-    if (microphone === capture) microphone = null;
-    state.recordingStopping = false;
-    render();
-  }
 }
 
 document.addEventListener('change', event => {
@@ -1097,6 +1097,7 @@ document.addEventListener('click', async event => {
           if (el) el.textContent = message;
         }, applyVision);
         await camera.start();
+        syncSense();
         render();
       }
     }
@@ -1106,6 +1107,16 @@ document.addEventListener('click', async event => {
   }
 });
 
+function syncSense() {
+  if (!camera || !state.snapshot) return;
+  const snap = state.snapshot;
+  const current = (snap.decisions || []).find(item => item.id === snap.active_decision);
+  const phase = snap.context_phase || snap.analysis?.phase || 'uncertain';
+  camera.setContext({
+    decision: current?.status === 'preparing' || phase === 'seeking_response' || phase === 'closing',
+    stableIds: (snap.segments || []).filter(seg => seg.stable).map(seg => seg.id)
+  });
+}
 function applyServerAnalysis() {
   const data = state.snapshot?.analysis;
   if (!data) return;
