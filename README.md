@@ -92,7 +92,7 @@ py -m venv .venv
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1
 ```
 
-首次准备会将语义、语音、视觉模型与 CPU 运行文件下载到工作区内，已有完整文件会跳过。安装依赖和下载需要网络，日常运行只访问本机及当前局域网。下载失败后重新运行对应脚本即可。脚本先写临时文件，再替换成正式文件，并记录来源与 SHA-256 清单。
+首次准备会将语义、语音、视觉模型与 CPU 运行文件下载到工作区内，已有完整文件会跳过。安装依赖和下载需要网络，日常运行只访问本机及当前局域网。下载失败后重新运行对应脚本即可。脚本先写临时文件，再替换成正式文件，并记录来源与 SHA-256 清单。`huggingface.co` 没有响应时，模型脚本会改从 `https://hf-mirror.com` 下载同一路径；llama.cpp 的 Windows CPU 包仍从 GitHub Release 下载。清单中的 `source` 是这次实际成功的地址。
 
 本次为了在现有环境直接运行，前端采用原生 ES Modules、HTML 和 CSS，无需 Node 包管理器和构建步骤。源代码均位于 tongxi/web。讨论转写的现行路径是本机 FunASR Runtime 2-pass。faster-whisper 仍留在代码中供既有模型检查脚本调用，会议页面不再使用它。视觉模型预置在本地。
 

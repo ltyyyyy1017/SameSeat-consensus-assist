@@ -16,19 +16,37 @@ FILES = {
 }
 
 
+def source_candidates(url):
+    found = [url]
+    prefix = "https://huggingface.co/"
+    if url.startswith(prefix):
+        found.append("https://hf-mirror.com/" + url[len(prefix):])
+    return found
+
+
 def download(item):
     name, url = item
     target = ROOT / name
     target.parent.mkdir(parents=True, exist_ok=True)
+    source = url
     if not target.exists():
         temporary = target.with_suffix(target.suffix + '.download')
-        request = urllib.request.Request(url, headers={"User-Agent": "Tongxi-local-setup"})
-        with urllib.request.urlopen(request, timeout=60) as response, temporary.open('wb') as output:
-            while chunk := response.read(1024*1024):
-                output.write(chunk)
-        temporary.replace(target)
-    print(name, target.stat().st_size, flush=True)
-    return name, {"source": url, "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}
+        last_error = None
+        for source in source_candidates(url):
+            try:
+                request = urllib.request.Request(source, headers={"User-Agent": "Tongxi-local-setup"})
+                with urllib.request.urlopen(request, timeout=60) as response, temporary.open('wb') as output:
+                    while chunk := response.read(1024*1024):
+                        output.write(chunk)
+                temporary.replace(target)
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+    print(name, target.stat().st_size, source, flush=True)
+    return name, {"source": source, "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}
 
 
 def main():
