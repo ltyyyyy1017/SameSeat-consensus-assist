@@ -58,6 +58,7 @@ const state = {
   epoch: '',
   seq: 0,
   review: null,
+  reviewed: new Map(),
   selected: new Set(),
   recording: false,
   recordingStarting: false,
