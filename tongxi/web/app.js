@@ -360,12 +360,10 @@ function render() {
     $('#camera-video').play().catch(() => {});
   }
   updateResponseClocks();
+  if (camera) window.tongxiVision = camera;
   if (state.e1 && window.tongxiE1) {
     window.tongxiE1.afterRender(state);
-    if (camera) {
-      window.tongxiVision = camera;
-      camera.onExperimentFrame = window.tongxiE1.recordFrame;
-    }
+    if (camera) camera.onExperimentFrame = window.tongxiE1.recordFrame;
   }
 }
 

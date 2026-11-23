@@ -288,18 +288,30 @@ def test_completed_calibration_stays_locked(monkeypatch, tmp_path):
     with TestClient(app) as client:
         _host, member, _decision = room(client)
         samples = {"listen": [[0, 0, 0, 0]] * 6, "speak": [[0, 1, 0, 0]] * 6, "wait": [[1, 0, 0, 0]] * 6}
-        call(client, member, "/e1/calibration", _calibration_body("first", samples, mouth=0.1))
+        ticket = call(client, member, "/e1/baseline-attempts", {"session_role": "calibration", "calibration_id": "first"})
+        call(client, member, "/e1/calibration", _calibration_body("first", samples, mouth=0.1, attempt_id=ticket["attempt_id"]))
         same = client.post(
             f'/api/v1/rooms/{member["room"]}/e1/calibration',
             json={"session_role": "calibration", "calibration_id": "first", "baseline": {"scale": 1, "mouth": 1, "pitch": 1, "turn": 1}, "samples": samples},
             headers=headers(member),
         )
         assert same.status_code == 422
-        call(client, member, "/e1/calibration", _calibration_body("second", samples, mouth=0.2, scale=0.3))
+        again = client.post(
+            f'/api/v1/rooms/{member["room"]}/e1/baseline-attempts',
+            json={"session_role": "calibration", "calibration_id": "second"},
+            headers=headers(member),
+        )
+        assert again.status_code == 422
+        second = client.post(
+            f'/api/v1/rooms/{member["room"]}/e1/calibration',
+            json=_calibration_body("second", samples, mouth=0.2, scale=0.3),
+            headers=headers(member),
+        )
+        assert second.status_code == 422
         exported = call(client, _host, "/e1/export", method="GET")
         assert exported["participants"][0]["calibration"]["calibration_id"] == "first"
         assert exported["participants"][0]["calibration"]["locked"] is True
-        assert len(exported["participants"][0]["calibration_history"]) == 2
+        assert len(exported["participants"][0]["calibration_history"]) == 1
 
 
 def test_client_files_keep_the_button_out_of_the_product_path():
@@ -487,7 +499,8 @@ def _measurements(scale=0.2, mouth=0.1, pitch=0.1, turn=0.0, count=32, invalid=0
 
 def _calibration_body(calibration_id, samples, **kwargs):
     measurements = kwargs.pop("baseline_measurements", None)
-    return {
+    attempt_id = kwargs.pop("attempt_id", None)
+    body = {
         "session_role": "calibration",
         "calibration_id": calibration_id,
         "duration_ms": kwargs.pop("duration_ms", 8000),
@@ -497,6 +510,9 @@ def _calibration_body(calibration_id, samples, **kwargs):
         "baseline_measurements": measurements if measurements is not None else _measurements(**kwargs),
         "samples": samples,
     }
+    if attempt_id:
+        body["attempt_id"] = attempt_id
+    return body
 
 
 _SAMPLE_SET = {"listen": [[0, 0, 0, 0]] * 6, "speak": [[0, 1, 0, 0]] * 6, "wait": [[1, 0, 0, 0]] * 6}
@@ -506,14 +522,19 @@ def _enroll(store, count, mouths=None, counts=None):
     for index in range(count):
         mouth = 0.10 + index * 0.01 if mouths is None else mouths[index]
         frames = 32 if counts is None else counts[index]
-        store.add_calibration("cohort", f"m{index}", _calibration_body(f"cal-{index}", _SAMPLE_SET, mouth=mouth, count=frames))
+        invalid = max(0, 30 - frames)
+        ticket = store.begin_baseline_attempt("cohort", f"m{index}", {"session_role": "calibration", "calibration_id": f"cal-{index}"})
+        store.add_calibration("cohort", f"m{index}", _calibration_body(
+            f"cal-{index}", _SAMPLE_SET, mouth=mouth, count=frames, invalid=invalid, attempt_id=ticket["attempt_id"],
+        ))
 
 
 def test_c01_one_frame_cannot_finish_calibration(tmp_path):
     assert neutral_baseline(_measurements(count=1), 8000, 480, 360) is None
     store = ExperimentStore(tmp_path)
+    ticket = store.begin_baseline_attempt("room", "m", {"session_role": "calibration", "calibration_id": "only"})
     with pytest.raises(ValueError, match="有效帧不足"):
-        store.add_calibration("room", "m", _calibration_body("only", _SAMPLE_SET, count=1))
+        store.add_calibration("room", "m", _calibration_body("only", _SAMPLE_SET, count=1, attempt_id=ticket["attempt_id"]))
     with pytest.raises(ValueError, match="单帧"):
         store.add_calibration("room", "m", {
             "session_role": "calibration", "calibration_id": "single", "samples": _SAMPLE_SET,
@@ -780,7 +801,9 @@ def test_c20_the_product_path_stays_when_e1_is_off(monkeypatch):
         assert snap["decisions"][0]["status"] == "discussing"
     vision = (ROOT / "tongxi/web/vision.js").read_text(encoding="utf-8")
     calibrate = vision.split("calibrate()", 1)[1].split("record(", 1)[0]
-    assert calibrate.index("startNeutralBaseline") < calibrate.index("this.baseline = {")
+    assert "baseline_arm" in calibrate
+    assert calibrate.index("onExperimentFrame") < calibrate.index("this.baseline = {")
+    assert "runNeutralBaseline" in vision
     assert "L1: 1000" in (ROOT / "tongxi/web/vision-policy.js").read_text(encoding="utf-8")
     assert MOUTH_THRESHOLD == 0.55
 
@@ -802,3 +825,45 @@ def test_withdraw_removes_features_without_putting_the_member_id_in_the_export(m
         assert member_id not in blob
         assert exported["participants"][0]["withdrawn"] is True
         assert exported["participants"][0]["sessions"] == []
+
+
+def test_server_rejects_baseline_outside_the_eight_second_bounds():
+    short = _measurements(count=24)
+    assert neutral_baseline(short, 1, 480, 360) is None
+    assert neutral_baseline(short, 7000, 480, 360) is None
+    accepted = neutral_baseline(_measurements(count=24, invalid=6), 8000, 480, 360)
+    assert accepted["valid_frames"] == 24
+    assert accepted["sampled_frames"] == 30
+    full = neutral_baseline(_measurements(count=32), 8000, 640, 480)
+    assert full["valid_frames"] == 32
+    assert full["sampled_frames"] == 32
+    assert neutral_baseline(_measurements(count=23, invalid=9), 8000, 480, 360) is None
+    assert neutral_baseline(_measurements(count=33), 8000, 480, 360) is None
+    poisoned = _measurements(count=32)
+    poisoned[0]["raw"]["mouth"] = float("nan")
+    poisoned[1]["raw"]["scale"] = float("inf")
+    dropped = neutral_baseline(poisoned, 8000, 480, 360)
+    assert dropped["valid_frames"] == 30
+    assert neutral_baseline(_measurements(count=32), 8000, 0, 360) is None
+    assert neutral_baseline(_measurements(count=32), 8000, True, 360) is None
+    assert neutral_baseline(_measurements(count=32), 8000, -1, 360) is None
+
+
+def test_attempts_are_server_side_and_cannot_be_reset(tmp_path):
+    store = ExperimentStore(tmp_path)
+    first = store.begin_baseline_attempt("room", "m", {"session_role": "calibration", "calibration_id": "first"})
+    with pytest.raises(ValueError, match="有效帧不足"):
+        store.add_calibration("room", "m", _calibration_body("first", _SAMPLE_SET, count=23, invalid=9, attempt_id=first["attempt_id"]))
+    with pytest.raises(ValueError, match="已经结束"):
+        store.add_calibration("room", "m", _calibration_body("brand-new", _SAMPLE_SET, attempt_id=first["attempt_id"]))
+    second = store.begin_baseline_attempt("room", "m", {"session_role": "calibration", "calibration_id": "brand-new"})
+    assert second["attempt_no"] == 2
+    with pytest.raises(ValueError, match="两次"):
+        store.begin_baseline_attempt("room", "m", {"session_role": "calibration", "calibration_id": "third"})
+    status = store.calibration_status("room", "m")
+    assert status["baseline"] is None
+    assert status["baseline_failed"] is True
+    assert status["attempts_used"] == 2
+    assert "member_id" not in status
+    with pytest.raises(ValueError, match="第二次讨论"):
+        store.begin_baseline_attempt("room", "m", {"session_role": "test", "calibration_id": "later"})

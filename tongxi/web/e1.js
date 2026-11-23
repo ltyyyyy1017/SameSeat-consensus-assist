@@ -20,6 +20,9 @@ let reviewTimer = 0;
 let uploadTimer = 0;
 let sending = false;
 let lastError = '';
+let baselineArming = false;
+let restoreStarted = false;
+let restoredBaseline = null;
 
 function authHeaders() {
   const session = JSON.parse(sessionStorage.getItem('tongxi:' + roomId()) || 'null');
@@ -115,27 +118,23 @@ export function attach() {
 export function recordFrame(frame) {
   const state = window.tongxiE1State;
   if (!state || !state.snapshot || state.snapshot.role !== 'member' || !collecting) return;
-  if (frame.event === 'baseline_failed') {
-    showError(frame.reason || '自然坐姿有效帧不足 24，基准没有更新');
+  if (frame.event === 'baseline_arm') {
+    if (sessionRole !== 'calibration') {
+      showError('第二次讨论不能重新采集自然坐姿。');
+      return;
+    }
+    if (baselineArming || (window.tongxiVision && window.tongxiVision.capture && window.tongxiVision.capture.kind === 'baseline')) return;
+    baselineArming = true;
+    const previous = window.tongxiVision ? window.tongxiVision.baseline : null;
+    post('/e1/baseline-attempts', {session_role: 'calibration', calibration_id: sessionId}).then(ticket => {
+      if (window.tongxiVision) window.tongxiVision.baseline = previous;
+      if (window.tongxiVision) window.tongxiVision.runNeutralBaseline(ticket);
+    }).catch(error => showError(error.message)).finally(() => { baselineArming = false; });
     return;
   }
-  if (frame.event === 'baseline_ready' && sessionRole === 'calibration') {
-    if (!sessionStorage.getItem(storageKey('cal-start'))) sessionStorage.setItem(storageKey('cal-start'), String(Date.now()));
-    const samples = JSON.parse(sessionStorage.getItem(storageKey('samples')) || '{}');
-    post('/e1/calibration', {
-      session_role: 'calibration',
-      calibration_id: sessionId,
-      duration_ms: frame.duration_ms,
-      video_width: frame.video_width,
-      video_height: frame.video_height,
-      attempt: frame.attempt,
-      baseline_measurements: frame.measurements,
-      samples
-    }).then(result => {
-      sessionStorage.setItem(storageKey('baseline'), JSON.stringify(result.baseline));
-      if (window.tongxiVision && result.baseline) window.tongxiVision.baseline = result.baseline;
-      showError('自然坐姿已按有效帧的中位数保存。');
-    }).catch(error => showError(error.message));
+  if (frame.event === 'baseline_failed' || frame.event === 'baseline_ready') {
+    if (sessionRole !== 'calibration') return;
+    submitBaseline(frame);
     return;
   }
   if (frame.event === 'calibration') return;
@@ -177,6 +176,52 @@ export function recordFrame(frame) {
   }]);
 }
 
+function submitBaseline(frame) {
+  const previous = window.tongxiVision ? window.tongxiVision.baseline : null;
+  if (!sessionStorage.getItem(storageKey('cal-start'))) sessionStorage.setItem(storageKey('cal-start'), String(Date.now()));
+  const samples = JSON.parse(sessionStorage.getItem(storageKey('samples')) || '{}');
+  post('/e1/calibration', {
+    session_role: 'calibration',
+    calibration_id: sessionId,
+    duration_ms: frame.duration_ms,
+    video_width: frame.video_width,
+    video_height: frame.video_height,
+    attempt: frame.attempt,
+    attempt_id: frame.attempt_id,
+    baseline_measurements: frame.measurements,
+    samples
+  }).then(result => {
+    sessionStorage.setItem(storageKey('baseline'), JSON.stringify(result.baseline));
+    if (window.tongxiVision && result.baseline) window.tongxiVision.baseline = result.baseline;
+    showError('自然坐姿已按有效帧的中位数保存。');
+  }).catch(error => {
+    if (window.tongxiVision) window.tongxiVision.baseline = previous;
+    showError(error.message);
+  });
+}
+
+function applyBaseline(baseline) {
+  if (!baseline) return;
+  restoredBaseline = baseline;
+  sessionStorage.setItem(storageKey('baseline'), JSON.stringify(baseline));
+  if (window.tongxiVision) window.tongxiVision.baseline = baseline;
+}
+
+async function restoreCalibration() {
+  if (!restoreStarted) {
+    restoreStarted = true;
+    const saved = JSON.parse(sessionStorage.getItem(storageKey('baseline')) || 'null');
+    applyBaseline(saved);
+    const response = await fetch(`/api/v1/rooms/${roomId()}/e1/calibration`, {headers: authHeaders()});
+    if (response.ok) {
+      const payload = await response.json();
+      if (payload.baseline) applyBaseline(payload.baseline);
+    }
+  } else if (restoredBaseline && window.tongxiVision && !window.tongxiVision.baseline) {
+    window.tongxiVision.baseline = restoredBaseline;
+  }
+}
+
 function calibrationDuration(samples) {
   const start = Number(sessionStorage.getItem(storageKey('cal-start')) || 0);
   const ready = ['listen', 'speak', 'wait'].every(label => samples[label] && samples[label].length >= 6);
@@ -185,6 +230,7 @@ function calibrationDuration(samples) {
 
 function afterRender(state) {
   window.tongxiE1State = state;
+  if (state.snapshot && state.snapshot.role === 'member') restoreCalibration();
   if (!state.snapshot || state.snapshot.role === 'board') return;
   const main = document.getElementById('main');
   if (!main || document.getElementById('e1-panel')) return;

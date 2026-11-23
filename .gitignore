@@ -2,6 +2,10 @@
 __pycache__/
 .pytest_cache/
 artifacts/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
 *.pyc
 .env
 .runtime/

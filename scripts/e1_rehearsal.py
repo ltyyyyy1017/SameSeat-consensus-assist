@@ -37,13 +37,22 @@ def enroll(store, room, count):
         mouth = 0.10 if index < 4 else 0.90
         frames = 32 if index < 4 else 24
         measurements = rows_for(mouth, frames)
+        if len(measurements) < 30:
+            measurements.extend({
+                "raw": {"scale": 9, "mouth": 9, "pitch": 9, "turn": 9},
+                "visibility_status": "multi_face", "face_count": 2, "shoulder_valid": False,
+            } for _ in range(30 - len(measurements)))
+        ticket = store.begin_baseline_attempt(room, f"drill-{index}", {
+            "session_role": "calibration", "calibration_id": f"cal-{index}",
+        })
         saved = store.add_calibration(room, f"drill-{index}", {
             "session_role": "calibration",
             "calibration_id": f"cal-{index}",
             "duration_ms": 8000,
             "video_width": 480,
             "video_height": 360,
-            "attempt": 1,
+            "attempt": ticket["attempt_no"],
+            "attempt_id": ticket["attempt_id"],
             "baseline_measurements": measurements,
             "samples": SAMPLES,
         })

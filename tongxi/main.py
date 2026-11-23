@@ -500,6 +500,21 @@ def create_app(auto_ai=True):
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
+    @app.post("/api/v1/rooms/{room}/e1/baseline-attempts")
+    def e1_baseline_attempt(room: str, body: dict, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有成员可以申请自己的坐姿采集", 403)
+        try:
+            return e1.ExperimentStore().begin_baseline_attempt(room, who["id"], body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/v1/rooms/{room}/e1/calibration")
+    def e1_calibration_status(room: str, authorization: str = Header(default="")):
+        who = e1_actor(room, authorization)
+        require(who["role"] == "member", "只有成员可以读取自己的基准", 403)
+        return e1.ExperimentStore().calibration_status(room, who["id"])
+
     @app.post("/api/v1/rooms/{room}/e1/calibration")
     def e1_calibration(room: str, body: dict, authorization: str = Header(default="")):
         who = e1_actor(room, authorization)

@@ -49,7 +49,10 @@ BASELINE_PROTOCOL = "neutral_pose_median_v1"
 BASELINE_MS = 8000
 BASELINE_INTERVAL_MS = 250
 BASELINE_TARGET = 32
+BASELINE_MIN_SAMPLES = 30
 BASELINE_MIN_VALID = 24
+BASELINE_MIN_MS = 7500
+BASELINE_MAX_MS = 10000
 BASELINE_MAX_ATTEMPT = 2
 REFERENCE_METHOD = "cohort_neutral_baseline_median_v1"
 REFERENCE_VERSION = "1.0"
@@ -63,7 +66,21 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS people (
   member_id TEXT PRIMARY KEY,
   participant_id TEXT UNIQUE,
-  withdrawn INTEGER DEFAULT 0
+  withdrawn INTEGER DEFAULT 0,
+  baseline_failed INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS baseline_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  member_id TEXT,
+  attempt_no INTEGER,
+  status TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  valid_frames INTEGER,
+  total_frames INTEGER,
+  failure_reason TEXT,
+  calibration_id TEXT,
+  log TEXT
 );
 CREATE TABLE IF NOT EXISTS calibrations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,7 +153,10 @@ def e1_enabled():
 
 
 def e1_dir():
-    return Path(os.getenv("TONGXI_E1_DIR") or "artifacts/e1")
+    configured = os.getenv("TONGXI_E1_DIR")
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().parents[2] / "06_实验数据" / "e1"
 
 
 def relative_feature(raw, baseline):
@@ -321,7 +341,9 @@ def _measurement_raw(item):
 
 def neutral_baseline(measurements, duration_ms, video_width, video_height, attempt=1):
     """四维原始值的中位数。不用上一份基准再归一化，也不拿最后一帧代替。"""
-    if not isinstance(measurements, list) or not measurements or len(measurements) > BASELINE_TARGET:
+    if attempt not in (1, 2):
+        return None
+    if not isinstance(measurements, list) or not BASELINE_MIN_SAMPLES <= len(measurements) <= BASELINE_TARGET:
         return None
     valid = [raw for raw in (_measurement_raw(item) for item in measurements) if raw]
     if not BASELINE_MIN_VALID <= len(valid) <= BASELINE_TARGET:
@@ -330,9 +352,11 @@ def neutral_baseline(measurements, duration_ms, video_width, video_height, attem
     mad = {key: statistics.median(abs(row[key] - medians[key]) for row in valid) for key in AXES}
     if not all(_finite_number(medians[key]) and _finite_number(mad[key]) for key in AXES):
         return None
+    if isinstance(video_width, bool) or isinstance(video_height, bool):
+        return None
     if not isinstance(video_width, int) or not isinstance(video_height, int) or video_width <= 0 or video_height <= 0:
         return None
-    if not isinstance(duration_ms, int) or duration_ms <= 0 or duration_ms > BASELINE_MS + 2000:
+    if not isinstance(duration_ms, int) or isinstance(duration_ms, bool) or not BASELINE_MIN_MS <= duration_ms <= BASELINE_MAX_MS:
         return None
     return {
         **medians,
@@ -358,6 +382,12 @@ def _baseline_usable(baseline):
         return False
     mad = baseline.get("mad")
     if not isinstance(mad, dict):
+        return False
+    if not BASELINE_MIN_SAMPLES <= baseline.get("sampled_frames", 0) <= BASELINE_TARGET:
+        return False
+    if not BASELINE_MIN_MS <= baseline.get("duration_ms", 0) <= BASELINE_MAX_MS:
+        return False
+    if baseline.get("attempt") not in (1, 2):
         return False
     return all(_finite_number(baseline.get(key)) and _finite_number(mad.get(key)) for key in AXES)
 
@@ -961,6 +991,8 @@ class ExperimentStore:
         ):
             if name not in names("labels"):
                 conn.execute(f"ALTER TABLE labels ADD COLUMN {name} {typedef}")
+        if "baseline_failed" not in names("people"):
+            conn.execute("ALTER TABLE people ADD COLUMN baseline_failed INTEGER DEFAULT 0")
         for name, typedef in (
             ("video_width", "INTEGER"),
             ("video_height", "INTEGER"),
@@ -1222,20 +1254,140 @@ class ExperimentStore:
             stored = conn.execute("SELECT COUNT(*) AS n FROM frames WHERE member_id=? AND session_id=?", (member_id, session_id)).fetchone()["n"]
         return {"duplicate": False, "accepted": accepted, "stored": stored, "participant_id": person["participant_id"]}
 
-    def _resolve_baseline(self, existing, body):
-        attempt = body.get("attempt", 1)
+    def _attempt_log(self, measurements):
+        log = []
+        for item in measurements or []:
+            if not isinstance(item, dict):
+                log.append({"visibility_status": "record_error"})
+                continue
+            if any(key in item for key in ("name", "image", "video", "audio", "jpeg", "png")):
+                raise ValueError("基准采集不保存画面、录音或姓名")
+            raw = item.get("raw") if isinstance(item.get("raw"), dict) else None
+            log.append({
+                "sampled_at_ms": item.get("sampled_at_ms"),
+                "visibility_status": item.get("visibility_status"),
+                "valid": _measurement_raw(item) is not None,
+                "raw": {key: raw.get(key) for key in AXES} if raw else None,
+            })
+        return log
+
+    def begin_baseline_attempt(self, room, member_id, body):
+        if body.get("session_role") != "calibration":
+            raise ValueError("第二次讨论不能重新采集自然坐姿")
+        blocked = None
+        ticket = None
+        with self._tx(room) as conn:
+            person = self._person(conn, member_id)
+            if person["baseline_failed"]:
+                blocked = "两次自然坐姿采集都已失败，不能继续纳入通用参照"
+            else:
+                active = conn.execute(
+                    "SELECT locked FROM calibrations WHERE member_id=? AND active=1",
+                    (member_id,),
+                ).fetchone()
+                succeeded = conn.execute(
+                    "SELECT COUNT(*) AS n FROM baseline_attempts WHERE member_id=? AND status='succeeded'",
+                    (member_id,),
+                ).fetchone()["n"]
+                used = conn.execute(
+                    "SELECT COUNT(*) AS n FROM baseline_attempts WHERE member_id=?",
+                    (member_id,),
+                ).fetchone()["n"]
+                if active and active["locked"]:
+                    blocked = "个人基准和样例已经锁定，不能重新采集"
+                elif succeeded:
+                    blocked = "自然坐姿已经采集成功，不能再开始"
+                elif used >= BASELINE_MAX_ATTEMPT:
+                    conn.execute("UPDATE people SET baseline_failed=1 WHERE member_id=?", (member_id,))
+                    blocked = "自然坐姿只允许两次尝试，刷新页面也不能重置"
+                else:
+                    attempt_no = used + 1
+                    attempt_id = "ba" + secrets.token_hex(8)
+                    conn.execute(
+                        """INSERT INTO baseline_attempts(attempt_id, member_id, attempt_no, status, started_at, calibration_id)
+                           VALUES (?, ?, ?, 'started', ?, ?)""",
+                        (attempt_id, member_id, attempt_no, datetime.now(timezone.utc).isoformat(), str(body.get("calibration_id") or "")),
+                    )
+                    ticket = {"attempt_id": attempt_id, "attempt_no": attempt_no, "participant_id": person["participant_id"]}
+        if blocked:
+            raise ValueError(blocked)
+        return ticket
+
+    def _finish_attempt(self, conn, row, status, body, reason):
+        measurements = body.get("baseline_measurements") or []
+        valid = len([item for item in measurements if isinstance(item, dict) and _measurement_raw(item)])
+        conn.execute(
+            """UPDATE baseline_attempts
+               SET status=?, finished_at=?, valid_frames=?, total_frames=?, failure_reason=?, log=?
+               WHERE attempt_id=? AND status='started'""",
+            (status, datetime.now(timezone.utc).isoformat(), valid, len(measurements), reason,
+             json.dumps(self._attempt_log(measurements), ensure_ascii=False), row["attempt_id"]),
+        )
+        if status == "failed":
+            failed = conn.execute(
+                "SELECT COUNT(*) AS n FROM baseline_attempts WHERE member_id=? AND status='failed'",
+                (row["member_id"],),
+            ).fetchone()["n"]
+            if failed >= BASELINE_MAX_ATTEMPT:
+                conn.execute("UPDATE people SET baseline_failed=1 WHERE member_id=?", (row["member_id"],))
+
+    def calibration_status(self, room, member_id):
+        with self._tx(room) as conn:
+            person = self._person(conn, member_id)
+            active = conn.execute(
+                "SELECT * FROM calibrations WHERE member_id=? AND active=1",
+                (member_id,),
+            ).fetchone()
+            baseline = json.loads(active["baseline"]) if active and active["baseline"] else None
+            if not _baseline_usable(baseline):
+                baseline = None
+            attempts = []
+            for row in conn.execute(
+                "SELECT attempt_no, status, valid_frames, total_frames, failure_reason FROM baseline_attempts WHERE member_id=? ORDER BY attempt_no",
+                (member_id,),
+            ):
+                attempts.append({
+                    "attempt_no": row["attempt_no"],
+                    "status": row["status"],
+                    "valid_frames": row["valid_frames"],
+                    "total_frames": row["total_frames"],
+                    "failure_reason": row["failure_reason"],
+                })
+        return {
+            "participant_id": person["participant_id"],
+            "baseline": baseline,
+            "locked": bool(active and active["locked"]),
+            "attempts_used": len(attempts),
+            "attempts": attempts,
+            "baseline_failed": bool(person["baseline_failed"]),
+        }
+
+    def _resolve_baseline(self, conn, member_id, existing, body):
         if "baseline_measurements" in body:
-            if attempt not in (1, 2):
-                raise ValueError("自然坐姿基准只允许重试一次")
+            attempt_id = body.get("attempt_id")
+            if not isinstance(attempt_id, str) or len(attempt_id) < 8:
+                raise ValueError("自然坐姿采集要先向服务端申请尝试")
+            row = conn.execute(
+                "SELECT * FROM baseline_attempts WHERE attempt_id=? AND member_id=?",
+                (attempt_id, member_id),
+            ).fetchone()
+            if not row:
+                raise ValueError("没有这次采集申请")
+            if row["status"] != "started":
+                raise ValueError("这次尝试已经结束，不能改成成功")
+            if row["calibration_id"] and body.get("calibration_id") and row["calibration_id"] != str(body.get("calibration_id")):
+                raise ValueError("不能用新的校准编号绕过已经申请的尝试")
             computed = neutral_baseline(
                 body.get("baseline_measurements") or [],
                 body.get("duration_ms"),
                 body.get("video_width"),
                 body.get("video_height"),
-                attempt,
+                row["attempt_no"],
             )
             if computed is None:
-                raise ValueError("有效帧不足 24，或这次采集不符合 8 秒协议。基准没有更新")
+                self._finish_attempt(conn, row, "failed", body, "有效帧、总采样或采集时长不符合 8 秒协议")
+                return None
+            self._finish_attempt(conn, row, "succeeded", body, None)
             return computed
         if existing and existing["baseline"]:
             stored = json.loads(existing["baseline"])
@@ -1267,17 +1419,23 @@ class ExperimentStore:
                 "SELECT * FROM calibrations WHERE member_id=? AND calibration_id=?",
                 (member_id, calibration_id),
             ).fetchone()
+            if active and active["locked"] and "baseline_measurements" in body:
+                raise ValueError("个人基准已经锁定，不能重新采集")
             if active and active["locked"] and not _samples_complete(incoming):
                 raise ValueError("已锁定的模板不能被一份未完成的校准替换")
             try:
-                baseline = self._resolve_baseline(existing, body)
+                baseline = self._resolve_baseline(conn, member_id, existing, body)
             except ValueError:
                 if active and active["locked"]:
                     raise ValueError("不完整采集不能覆盖已锁定的自然坐姿基准")
                 raise
-            if not _baseline_usable(baseline):
+            refused = None
+            result = None
+            if baseline is None:
+                refused = "有效帧不足 24，或这次采集不符合 8 秒协议。基准没有更新"
+            elif not _baseline_usable(baseline):
                 raise ValueError("自然坐姿基准还没有达到 24 帧有效采集，不能建立样例")
-            if active and active["locked"]:
+            elif active and active["locked"]:
                 digest = template_sha(baseline, incoming)
                 conn.execute(
                     """INSERT INTO calibrations(member_id, calibration_id, duration_ms, baseline, samples, locked, active, version, sha256)
@@ -1285,34 +1443,38 @@ class ExperimentStore:
                     (member_id, calibration_id, body.get("duration_ms"), json.dumps(baseline, ensure_ascii=False),
                      json.dumps(incoming, ensure_ascii=False), "later", digest),
                 )
-                return {
+                result = {
                     "participant_id": person["participant_id"],
                     "locked": True,
                     "active_calibration_id": active["calibration_id"],
                     "stored_as": "history",
                     "baseline": json.loads(active["baseline"]),
                 }
-            samples = incoming
-            locked = 1 if _samples_complete(samples) else 0
-            digest = template_sha(baseline, samples) if locked else None
-            version = "1" if locked else None
-            payload = (body.get("duration_ms"), json.dumps(baseline, ensure_ascii=False), json.dumps(samples, ensure_ascii=False), locked, 1 if locked or not active else 0, version, digest, member_id, calibration_id)
-            if existing:
-                conn.execute(
-                    """UPDATE calibrations SET duration_ms=?, baseline=?, samples=?, locked=?, active=?, version=?, sha256=?
-                       WHERE member_id=? AND calibration_id=?""",
-                    payload,
-                )
             else:
-                conn.execute(
-                    """INSERT INTO calibrations(duration_ms, baseline, samples, locked, active, version, sha256, member_id, calibration_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    payload,
-                )
-            if locked:
-                conn.execute("UPDATE calibrations SET active=0 WHERE member_id=? AND calibration_id<>?", (member_id, calibration_id))
-                conn.execute("UPDATE calibrations SET active=1 WHERE member_id=? AND calibration_id=?", (member_id, calibration_id))
-        return {"participant_id": person["participant_id"], "locked": bool(locked), "active_calibration_id": calibration_id, "baseline": baseline}
+                samples = incoming
+                locked = 1 if _samples_complete(samples) else 0
+                digest = template_sha(baseline, samples) if locked else None
+                version = "1" if locked else None
+                payload = (body.get("duration_ms"), json.dumps(baseline, ensure_ascii=False), json.dumps(samples, ensure_ascii=False), locked, 1 if locked or not active else 0, version, digest, member_id, calibration_id)
+                if existing:
+                    conn.execute(
+                        """UPDATE calibrations SET duration_ms=?, baseline=?, samples=?, locked=?, active=?, version=?, sha256=?
+                           WHERE member_id=? AND calibration_id=?""",
+                        payload,
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO calibrations(duration_ms, baseline, samples, locked, active, version, sha256, member_id, calibration_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        payload,
+                    )
+                if locked:
+                    conn.execute("UPDATE calibrations SET active=0 WHERE member_id=? AND calibration_id<>?", (member_id, calibration_id))
+                    conn.execute("UPDATE calibrations SET active=1 WHERE member_id=? AND calibration_id=?", (member_id, calibration_id))
+                result = {"participant_id": person["participant_id"], "locked": bool(locked), "active_calibration_id": calibration_id, "baseline": baseline}
+        if refused:
+            raise ValueError(refused)
+        return result
 
     def mark_speech(self, room, participant_id, body):
         if not participant_id or not isinstance(body.get("t_speech_ms"), int):
@@ -1360,6 +1522,7 @@ class ExperimentStore:
             conn.execute("DELETE FROM labels WHERE member_id=?", (member_id,))
             conn.execute("DELETE FROM calibrations WHERE member_id=?", (member_id,))
             conn.execute("DELETE FROM speeches WHERE participant_id=?", (person["participant_id"],))
+            conn.execute("DELETE FROM baseline_attempts WHERE member_id=?", (member_id,))
             conn.execute("UPDATE people SET withdrawn=1 WHERE member_id=?", (member_id,))
         return {"participant_id": person["participant_id"], "withdrawn": True}
 
@@ -1378,7 +1541,7 @@ class ExperimentStore:
     def _eligible(self, conn):
         found = []
         for person in conn.execute("SELECT * FROM people"):
-            if person["withdrawn"]:
+            if person["withdrawn"] or person["baseline_failed"]:
                 continue
             row = conn.execute(
                 "SELECT * FROM calibrations WHERE member_id=? AND active=1 AND locked=1",
